@@ -2,8 +2,10 @@
 
 **Status (2026-07-12):** research phase complete (`docs/research/`, nine
 reports); porting guide and contracts drafted; **Phase 0 complete**
-(deps wired, skeleton, three dependency smokes, 14/14 tests).
-**Next: Phase 0b — hashline.**
+(deps wired, skeleton, three dependency smokes); **Phase 0b complete**
+(hashline engine, 222/222 upstream corpus cases, adversarial review
+fixes, 340/340 tests). **Next: Phase 1 — agent core + the four
+essential tools.**
 
 Phased implementation plan. Ordering is forced by the upstream dependency
 spine (hashline → catalog → agent core → tools → session → modes → TUI →

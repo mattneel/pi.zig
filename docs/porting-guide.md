@@ -489,6 +489,25 @@ Track every deviation here; anything not listed is a bug.
 15. Download/URL fetch policy inherited from ai.zig for provider media;
     app-level web tools (when they land) carry their own allow/deny
     policy (hostname-vs-resolved-address gap documented there).
+16. Hashline unseen-line previews preserve the upstream 512 UTF-16-code-unit
+    budget but stop at a complete UTF-8 code point. At the exact boundary an
+    astral character is omitted rather than emitting invalid UTF-8.
+17. Hashline block resolution is injectable in Phase 0b, with no bundled
+    tree-sitter resolver. `INS.BLK.POST` keeps the upstream plain-insert
+    fallback; unresolved `SWAP.BLK`/`DEL.BLK` keep their upstream failure or
+    preview-drop behavior. The resolver implementation lands with the later
+    tree-sitter phase.
+18. Hashline `Patch.parse` validates section bodies eagerly while the upstream
+    `PatchSection` caches them lazily. Successful values and exact failure text
+    match; malformed bodies fail during `Patch.parse`/`parseSingle` instead of
+    the later `PatchSection.parse`/prepare call.
+19. In-memory hashline snapshot `recorded_at` is a monotonic store tick rather
+    than a wall-clock millisecond timestamp. LRU ordering, head/chain identity,
+    and collision selection are preserved without adding a clock dependency.
+20. Hashline semantic failures, including mismatches, return a tagged Zig
+    `Failure` value rather than throwing a payload-bearing error object.
+    `MismatchError` remains public for callers that need the structured fields;
+    Patcher failures preserve its kind and byte-exact rendered message.
 
 ## 17. Phase-0 specifics (for the first implementation task)
 
