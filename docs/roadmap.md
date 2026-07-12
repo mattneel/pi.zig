@@ -4,8 +4,10 @@
 reports); porting guide and contracts drafted; **Phase 0 complete**
 (deps wired, skeleton, three dependency smokes); **Phase 0b complete**
 (hashline engine, 222/222 upstream corpus cases, adversarial review
-fixes, 340/340 tests). **Next: Phase 1 — agent core + the four
-essential tools.**
+fixes). **Phase 1 in progress:** 1a foundations landed (message model +
+lowering, session entries, catalog, truncation core, approval table,
+event contract — reviewed, 398/398 tests); next 1b (the loop) then
+1c (the four essential tools).
 
 Phased implementation plan. Ordering is forced by the upstream dependency
 spine (hashline → catalog → agent core → tools → session → modes → TUI →

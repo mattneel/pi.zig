@@ -508,6 +508,15 @@ Track every deviation here; anything not listed is a bug.
     `Failure` value rather than throwing a payload-bearing error object.
     `MismatchError` remains public for callers that need the structured fields;
     Patcher failures preserve its kind and byte-exact rendered message.
+21. Developer-origin content lowers to ordinary user-role model messages in v1.
+    Anthropic's optional upgrade of eligible mid-conversation developer turns to
+    system parameters is deferred until provider compatibility metadata is
+    available in the lowering boundary.
+22. ai.zig's current `ToolResultOutput` cannot carry both an error marker and a
+    content-part array. Multi-block error results keep their text blocks separate
+    through `.content`; empty and single-text errors use `.error_text`. The Pi
+    message retains `isError`, so this can be removed when ai.zig exposes an
+    error-content variant.
 
 ## 17. Phase-0 specifics (for the first implementation task)
 

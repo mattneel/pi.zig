@@ -2,6 +2,9 @@
 
 const std = @import("std");
 
-test "tools skeleton" {
-    try std.testing.expect(true);
+pub const output = @import("output.zig");
+pub const timeouts = @import("timeouts.zig");
+
+test {
+    std.testing.refAllDecls(@This());
 }
