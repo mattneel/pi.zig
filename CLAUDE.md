@@ -23,19 +23,54 @@ changelog would, not the way a security report would.
 
 ## Role split
 You plan and review. You never implement — all code changes go through
-the `codex` MCP tool.
+the `codex` CLI (NOT the codex MCP tool — its bridge times out at 30
+minutes of silence and severs long tasks; the CLI has no such limit).
 
-Calling Codex — every new task is one `codex` tool call with exactly:
-- prompt: the task spec — goal, relevant files, constraints,
-  acceptance criteria with exact test commands
-- model: "gpt-5.6-sol"
-- sandbox: "danger-full-access"
-- approval-policy: "never"
-- config: { "model_reasoning_effort": "max"}
+Calling Codex — every new task is one `codex exec` run, launched via the
+Bash tool with `run_in_background: true` (tasks run 30-90+ min; you get
+notified on completion). The prompt is the task spec — goal, relevant
+files, constraints, acceptance criteria with exact test commands — fed
+on stdin via heredoc:
 
-Take threadId from the response. Revisions go through `codex-reply`
-with that threadId and your review notes — one thread per task, new
-thread only if the approach itself is wrong.
+```sh
+codex exec \
+  -m gpt-5.6-sol \
+  --yolo \
+  -c model_reasoning_effort=max \
+  -C /home/autark/src/zig/pi.zig \
+  -o /tmp/codex-last-message.md \
+  - <<'CODEX_EOF'
+<task spec here>
+CODEX_EOF
+```
+
+- `--yolo` = no approvals, no sandbox (alias for
+  `--dangerously-bypass-approvals-and-sandbox`; banner shows
+  `approval: never, sandbox: danger-full-access`). Verified working on
+  exec and resume in 0.144.1 despite being absent from `--help`.
+- `-o <file>` captures the final summary — read that file when the run
+  completes (stdout also streams progress; useful for checking on it
+  mid-run with Read on the background task's output file).
+- The session id is printed in the run banner ("session id: <uuid>")
+  and is also the newest rollout filename under
+  `~/.codex/sessions/<Y>/<m>/<d>/rollout-*-<uuid>.jsonl`. Record it.
+
+Revisions go through `codex exec resume` with that session id and your
+review notes — one session per task, a new session only if the approach
+itself is wrong:
+
+```sh
+codex exec resume <SESSION_ID> \
+  --yolo \
+  -c model_reasoning_effort=max \
+  -o /tmp/codex-last-message.md \
+  - <<'CODEX_EOF'
+<review findings / fix list>
+CODEX_EOF
+```
+
+(`--yolo` and `-c` overrides are per-invocation — re-pass them on every
+resume. `resume` does not accept `--color`.)
 
 Review `git diff` and run the acceptance commands yourself.
 You commit when green.
