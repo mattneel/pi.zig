@@ -16,9 +16,9 @@ Pi coding agent** (upstream: [oh-my-pi](https://github.com/can1357/oh-my-pi)'s
 │ providers · streaming · tool loop   │
 │ cancellation · structured output    │
 ├─────────────────────────────────────┤
-│ ZigZag TUI                          │
-│ input · transcript · dialogs        │
-│ diffs · markdown · terminal I/O     │
+│ tuizr TUI                           │
+│ input · block transcript · markdown │
+│ cell renderer · terminal I/O        │
 └─────────────────────────────────────┘
 ```
 
@@ -32,19 +32,25 @@ upstream's Bun/Python runtimes.
 
 ## Status
 
-Early. The agent core is under active construction; nothing here is
-usable as a daily driver yet.
+Phases 0–3b. A working headless agent — a real model loop with the four
+essential tools, session persistence, and print/JSON modes — plus an
+interactive TUI on **tuizr** that streams markdown-rendered replies. Usable
+interactively today (against a real provider key); the interactive UX depth
+(phase 3c) and the later tool/scripting surfaces are still landing.
 
 | Surface | State |
 | --- | --- |
 | Foundations (deps wired, module skeleton, dependency smokes) | **done** |
 | hashline edit engine (tags, lenient parser, apply, recovery, snapshots) | **done** — 222/222 upstream corpus cases ported |
-| Agent core (loop, steering/follow-up queues, scheduler, mailboxes) | in progress (phase 1) |
-| Essential tools: `read` · `bash` · `edit` · `write` | in progress (phase 1) |
-| Print / JSON modes + JSONL session persistence | planned (phase 2) |
-| Interactive TUI on ZigZag | planned (phase 3) |
+| Agent core (loop, steering/follow-up queues, scheduler, mailboxes, retry ladder) | **done** (phase 1) |
+| Essential tools: `read` · `bash` · `edit` · `write` | **done** (phase 1) |
+| Catalog + cost/thinking (levels `off`…`max`, plus `ultra`) | **done** |
+| JSONL session store + resume; CLI + JSON settings; print / JSON modes | **done** (phase 2) |
+| Interactive TUI on tuizr — cell renderer, non-blocking input, streaming | **done** (phase 3a) |
+| Markdown rendering + block transcript (user / assistant / thinking / tool / error) | in progress (phase 3b) |
+| Status line, working spinner, scroll-back, composer depth (kill-ring, history, sigils, autocomplete) | planned (phase 3c) |
 | Compaction + session tree operations | planned (phase 4) |
-| `glob` · `grep` · `todo`, approvals UI, slash commands | planned (phase 5) |
+| `glob` · `grep` · `todo`, approvals UI, slash commands, diffs | planned (phase 5) |
 | QuickJS `eval` tool | planned (phase 6) |
 | Extensions (QuickJS host) | planned (phase 7) |
 | RPC mode | planned (phase 8) |
@@ -85,12 +91,14 @@ zig build test -Dtest-filter=hashline   # filtered
 zig build run -- --version
 ```
 
-Dependencies are commit-pinned in `build.zig.zon`:
+Dependencies in `build.zig.zon`:
 [ai.zig](https://github.com/mattneel/ai.zig) (providers, streaming,
-tool-call plumbing, MCP), [ZigZag](https://github.com/meszmate/zigzag)
-(terminal UI), and
+tool-call plumbing, MCP) and
 [zig-quickjs-ng](https://github.com/mattneel/zig-quickjs-ng)
-(quickjs-ng 0.15.1). Live-API smoke tests are opt-in (`-Dlive`) and
+(quickjs-ng 0.15.1) are commit-pinned; **tuizr** — a high-performance,
+renderer-first TUI library — is the frontend, wired as a local-path
+dependency during co-development (pi.zig is its first real consumer and
+drives its widget set). Live-API smoke tests are opt-in (`-Dlive`) and
 never run by default.
 
 ## Repository layout
