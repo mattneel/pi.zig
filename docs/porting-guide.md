@@ -301,11 +301,20 @@ layers are sound; the component layer is a parts bin. Design:
   60 fps pacing bounds mailbox latency at ~16 ms; a `Program.post`/wake
   upstream contribution removes even that (insertion points documented in
   zigzag-verify §13).
-- **Ctrl+C**: ZigZag hardcodes quit-before-model. Phase 3 prerequisite: a
-  fork adding `ctrl_c: enum { quit, forward }` (+ matching ctrl_z), pinned
-  by commit; PR'd upstream in parallel. Pi semantics (flush → double-press
-  500 ms → exit; single → clear editor; exit 130 while shutdown in flight)
-  then live in the app.
+- **Cancel/quit keys (no fork; ledger L68)**: ZigZag's `processKeyEvent`
+  (`core/program.zig`) intercepts only Ctrl+C (→ `running = false`, quit)
+  and Ctrl+Z (→ suspend, gated by `suspend_enabled`); every other key,
+  including Escape, is dispatched to the app model. So **Escape cancels the
+  running turn** (delivered as `AgentCommand.cancel`; this is also step 8 of
+  Pi's Esc ladder and matches Claude Code / Codex), needing no framework
+  change. **Ctrl+C keeps ZigZag's default quit**: `run()` returns to our code,
+  where the post-loop shutdown cancels the active run future, `flushSync`es
+  the session, restores the terminal, and prints the resume hint — so a
+  stray Ctrl+C loses nothing and re-entry is one `--continue`/`--resume`
+  away. Deferred (optional later refinement): a `ctrl_c: enum { quit,
+  forward }` option upstreamed to ZigZag to recover Pi's guarded Ctrl+C
+  (single clears editor, double-press-500 ms exits). Not a Phase 3
+  prerequisite.
 - **TranscriptView (custom)**: unit = rendered block
   (`user|assistant|reasoning|tool|bash_execution|compaction|error`), each
   caching rendered rows, height, width, theme revision,
@@ -669,6 +678,16 @@ Track every deviation here; anything not listed is a bug.
     Runtime keys, literal or environment-named models-config keys, and the five
     first-party provider environment variables are supported; command-backed
     and OAuth keys remain deferred.
+68. Cancel is Escape, quit is Ctrl+C — no ZigZag fork. Upstream Pi routes
+    Ctrl+C to the app (single press clears the editor, double press within
+    500 ms exits) and cancels the turn via the Esc ladder. The port keeps
+    ZigZag's default Ctrl+C quit and uses Escape alone to cancel the running
+    turn (`AgentCommand.cancel`). Ctrl+C quit still exits cleanly: the post-
+    loop shutdown cancels the run future, `flushSync`es the session, restores
+    the terminal, and prints the resume hint, so no session state is lost and
+    re-entry is one `--continue`/`--resume` away. The guarded-Ctrl+C behavior
+    and its `ctrl_c: enum { quit, forward }` ZigZag option are deferred to an
+    optional later refinement, not a Phase 3 prerequisite.
 
 ## 17. Phase-0 specifics (for the first implementation task)
 

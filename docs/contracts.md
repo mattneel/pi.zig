@@ -139,8 +139,12 @@ parent `task` approval boundary.
 - **[open]** Session-file interop guarantee level with upstream omp
   (read-compatible? bidirectional?) — currently: same format, separate
   root (`~/.omp-zig/`), no cohabitation claim.
-- **[open]** ZigZag upstreaming: ctrl_c option and post/wake accepted
-  upstream vs long-lived fork.
+- **[decided]** Ctrl+C keybinding: no ZigZag fork. Escape cancels the
+  running turn; Ctrl+C keeps ZigZag's default quit (clean — post-loop
+  shutdown flushes and prints the resume hint). The `ctrl_c` forward option
+  is deferred to an optional upstream contribution (ledger L68).
+- **[open]** ZigZag `post`/wake thread-safe mailbox: upstream contribution
+  vs mailbox-drain-before-tick at 60 fps.
 - **[open]** Windows support tier (ConPTY bash, suspend semantics).
 - **[open]** Duplicate tool-call ids within one response (inherits
   ai.zig's last-write-wins; needs a defined contract + test here too).

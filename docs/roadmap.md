@@ -18,15 +18,20 @@ load + v1→v3 migrations, resume) plus the gated `-Dlive` Anthropic smoke;
 provider construction, and print/JSON modes as pure `AgentEvent` consumers
 with byte-exact goldens. Every subsystem multi-reviewed against upstream and
 adversarially audited; 516/517 tests (1 gated live), green across seeds.
-**Next: Phase 3 — ZigZag TUI core. Prerequisite: pin the zigzag fork with
-the `ctrl_c` forward option before the TUI lands.**
+**Next: Phase 3 — ZigZag TUI core. No zigzag fork required: Escape cancels
+the running turn (reaches the app natively, matching Claude Code / Codex and
+Pi's own Esc ladder), and Ctrl+C keeps ZigZag's default quit — clean because
+our post-loop shutdown still cancels the run, flushes the session, and exits
+showing the resume hint. The `ctrl_c: enum{quit,forward}` fork is deferred to
+an optional later refinement (ledger L68), not a prerequisite.**
 
 Phased implementation plan. Ordering is forced by the upstream dependency
 spine (hashline → catalog → agent core → tools → session → modes → TUI →
 compaction → QuickJS) plus two project constraints: the
 `AgentCommand`/`AgentEvent` contract must stabilize before any frontend
-lands (print/JSON prove it before the TUI consumes it), and the ZigZag
-fork (ctrl_c dispatch + thread-safe post) must be pinned before Phase 3.
+lands (print/JSON prove it before the TUI consumes it). Phase 3 needs no
+ctrl_c fork (Escape cancels; ledger L68); a thread-safe `post`/wake ZigZag
+contribution stays optional (mailbox-drain-before-tick at 60 fps otherwise).
 
 Every phase lands with tests derived from the upstream behavior specs
 (exact constants/strings cited in `docs/research/`), and `zig build test`
@@ -117,8 +122,12 @@ loads in a JSONL validator against upstream's documented format; kill
 
 **Goal:** sequence step 3 — interactive parity for the daily loop.
 
-- **Prereq:** zigzag fork pinned with `ctrl_c` forward option (+ post/wake
-  if ready; otherwise mailbox-drain-before-tick at 60 fps).
+- **No ctrl_c fork prereq (ledger L68):** Escape cancels the running turn
+  (reaches the app natively; ZigZag only intercepts Ctrl+C/Ctrl+Z). Ctrl+C
+  keeps ZigZag's default quit; our post-loop shutdown cancels the run,
+  `flushSync`es the session, restores the terminal, and prints the resume
+  hint, so an accidental Ctrl+C loses nothing. A thread-safe `post`/wake
+  contribution stays optional (mailbox-drain-before-tick at 60 fps otherwise).
 - Manual start/tick loop + mailbox bridge; TranscriptView (blocks, caches,
   finalization, one-blank-separator); cached streaming markdown; composer
   (multiline, history, kill ring, paste collapse, sigils, autocomplete for
