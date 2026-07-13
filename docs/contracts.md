@@ -40,15 +40,17 @@ Three layers, matching ai.zig's model:
    run reported aborted. QuickJS cells are the exception: the interrupt
    handler stops synchronous JS in-process, state preserved (ledger L5).
 
-## Session persistence `[planned]`
+## Session persistence `[verified]`
 
 - Append-only entry tree with a mutable leaf pointer; entries are never
-  rewritten in place except the fixed-width title slot and the documented
-  atomic-rewrite operations (rename, prune, fork, migration).
+  rewritten in place except the fixed-width title slot. Full-session rewrites,
+  including migration rewrites, use a temporary file and atomic replacement;
+  rename, prune, and fork orchestration is deferred (ledger 56).
 - Nothing is persisted before the first assistant message exists.
-- Ctrl+C performs a synchronous flush before teardown; a hard kill loses
-  at most the unflushed tail, never corrupts earlier lines (JSONL,
-  lenient load).
+- Agent shutdown drains and synchronizes the writer. `flushSync()` synchronizes
+  an already-current file and performs a full synchronous rewrite only when a
+  migration or other pending rewrite requires one. A hard kill loses at most
+  the unflushed tail, never corrupts earlier lines (JSONL, lenient load).
 - Strings > 500 000 chars are truncated with the upstream marker; base64
   images ≥ 1024 chars live in the content-addressed blob store.
 - The `ModelMessage` core of every message entry round-trips through

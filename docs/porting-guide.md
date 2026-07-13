@@ -611,6 +611,31 @@ Track every deviation here; anything not listed is a bug.
     starts from its controlled command/session environment; inheriting the base
     keeps command lookup working until shell-snapshot environment capture is
     ported.
+54. `OMP_ZIG_AGENT_DIR` replaces upstream's `PI_CODING_AGENT_DIR`. The separate
+    name prevents a pi.zig test or installation from writing into an installed
+    omp agent root. Zig 0.16 entrypoints inject `std.process.Environ`; library
+    callers without process state can pass an explicit agent directory.
+55. Phase 2a `continueRecent` selects the newest modification time in the
+    encoded cwd directory. Upstream terminal breadcrumbs are deferred until a
+    terminal frontend can create, refresh, and expire them.
+56. Phase 2a leaves `fork`, `branchWithSummary`, and `moveTo` as storage seams.
+    Their lineage, summary generation, artifact movement, and atomic rewrite
+    orchestration land with the later session-management frontend slice.
+57. A malformed physical first JSONL record makes the file an empty fresh
+    session at that path. Upstream skips malformed records until it finds a
+    valid header; the stricter rule avoids resuming a file whose title/header
+    boundary cannot be established.
+58. Selector-only files are reported as draft-only and not resumable as
+    conversations. Upstream instead uses a `.draft-only-session` artifact for
+    lifecycle cleanup and has no `resumable` listing field; artifact cleanup is
+    deferred with the frontend draft lifecycle.
+59. Phase 2a exposes the fixed-width title-slot rewrite primitive without
+    automatically appending a `title_change` audit entry. Session naming and
+    its audit orchestration land with the Phase 2b CLI/settings slice.
+60. Persistence truncation stops before a UTF-8 scalar that would cross the
+    500,000 UTF-16-unit boundary. Upstream slices JavaScript UTF-16 code units
+    and can split a surrogate pair at that boundary; Zig keeps the persisted
+    string valid UTF-8, following the string-boundary adaptation in ledger L16.
 
 ## 17. Phase-0 specifics (for the first implementation task)
 

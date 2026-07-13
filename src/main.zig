@@ -1,6 +1,6 @@
 const std = @import("std");
-const build_options = @import("build_options");
 const pi = @import("pi");
+const build_options = pi.build_options;
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());

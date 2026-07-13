@@ -5,6 +5,7 @@
 //! cross the outbox only through deep-copying mailbox pushes.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const ai = @import("ai");
 const provider = @import("provider");
 const provider_utils = @import("provider_utils");
@@ -18,6 +19,7 @@ const message = @import("message.zig");
 const raise = @import("raise.zig");
 const replay_policy = @import("replay_policy.zig");
 const scheduler = @import("scheduler.zig");
+const session_manager = @import("../session/manager.zig");
 const tool_api = @import("tool.zig");
 
 const Allocator = std.mem.Allocator;
@@ -90,6 +92,9 @@ pub const Options = struct {
     command_capacity: usize = 64,
     event_capacity: usize = 256,
     retry: RetryOptions = .{},
+    /// When absent, the agent owns an in-memory session manager.
+    session_manager: ?*session_manager.SessionManager = null,
+    max_output_tokens: ?f64 = null,
 };
 
 const AbortKind = enum(u8) {
@@ -143,6 +148,7 @@ const LiveCallSettings = struct {
     system_prompt: []const u8,
     active_tools: ?[]const []const u8,
     thinking: catalog.ThinkingLevel,
+    max_output_tokens: ?f64,
 };
 
 pub const AgentSession = struct {
@@ -174,6 +180,9 @@ pub const AgentSession = struct {
     approval_mode: approval.ApprovalMode,
     approval_policy: ?ApprovalPolicyResolver,
     retry: RetryOptions,
+    session_manager: *session_manager.SessionManager,
+    owns_session_manager: bool,
+    max_output_tokens: ?f64,
 
     state_mutex: std.Io.Mutex = .init,
     initial_queue: std.ArrayList(events.OwnedPrompt) = .empty,
@@ -210,6 +219,19 @@ pub const AgentSession = struct {
         var event_outbox = try mailbox.EventOutbox.init(gpa, options.event_capacity);
         errdefer event_outbox.deinit();
 
+        const persistence = if (options.session_manager) |manager|
+            manager
+        else blk: {
+            const manager = try gpa.create(session_manager.SessionManager);
+            errdefer gpa.destroy(manager);
+            manager.* = try session_manager.SessionManager.inMemory(gpa, io, ".");
+            break :blk manager;
+        };
+        errdefer if (options.session_manager == null) {
+            persistence.deinit();
+            gpa.destroy(persistence);
+        };
+
         const fallback_models = try config_arena.alloc(ModelTarget, options.fallback_models.len);
         for (options.fallback_models, fallback_models) |target, *destination| {
             destination.* = try cloneTarget(config_arena, target);
@@ -232,7 +254,7 @@ pub const AgentSession = struct {
         const current_model_role = if (options.model_role) |role| try config_arena.dupe(u8, role) else null;
         const system_prompt = try config_arena.dupe(u8, options.system_prompt);
 
-        return .{
+        var result: AgentSession = .{
             .gpa = gpa,
             .io = io,
             .config_arena_state = config_arena_state,
@@ -258,7 +280,12 @@ pub const AgentSession = struct {
             .approval_mode = options.approval_mode,
             .approval_policy = options.approval_policy,
             .retry = options.retry,
+            .session_manager = persistence,
+            .owns_session_manager = options.session_manager == null,
+            .max_output_tokens = options.max_output_tokens,
         };
+        try result.restoreFromSession();
+        return result;
     }
 
     /// Call after `run` has returned (normally by sending `.shutdown`).
@@ -278,6 +305,10 @@ pub const AgentSession = struct {
         self.commands.deinit();
         self.event_outbox.deinit();
         self.catalog_registry.deinit();
+        if (self.owns_session_manager) {
+            self.session_manager.deinit();
+            self.gpa.destroy(self.session_manager);
+        }
         self.message_arena_state.deinit();
         self.config_arena_state.deinit();
         self.* = undefined;
@@ -295,6 +326,14 @@ pub const AgentSession = struct {
     /// is idle. Use `cloneMessages` for a caller-owned snapshot.
     pub fn messagesBorrowed(self: *const AgentSession) []const message.AgentMessage {
         return self.messages.items;
+    }
+
+    pub fn persistedUsage(self: *const AgentSession) message.Usage {
+        return self.session_manager.usageTotals();
+    }
+
+    pub fn sessionManager(self: *AgentSession) *session_manager.SessionManager {
+        return self.session_manager;
     }
 
     /// Deep-copy the current history into a caller-owned arena. The returned
@@ -378,6 +417,7 @@ pub const AgentSession = struct {
                     self.state_mutex.lockUncancelable(self.io);
                     self.thinking = thinking;
                     self.state_mutex.unlock(self.io);
+                    _ = try self.session_manager.appendThinkingChange(@tagName(thinking));
                 },
                 .compact => try self.emitNotice(.info, "Compaction is deferred to Phase 4"),
                 .approve => |decision| try self.resolveApproval(decision),
@@ -387,6 +427,7 @@ pub const AgentSession = struct {
                 .shutdown => {
                     self.shutting_down.store(true, .release);
                     self.cancel(.shutdown);
+                    try self.session_manager.flush();
                     break;
                 },
             }
@@ -478,6 +519,7 @@ pub const AgentSession = struct {
     fn hostAppend(raw: *anyopaque, value: message.AgentMessage) anyerror!void {
         const self: *AgentSession = @ptrCast(@alignCast(raw));
         try self.messages.append(self.message_arena_state.allocator(), value);
+        _ = try self.session_manager.appendMessage(value);
     }
 
     fn hostPerformStep(raw: *anyopaque, choice: ?ai.prompt.ToolChoice) anyerror!message.AssistantMessage {
@@ -570,6 +612,7 @@ pub const AgentSession = struct {
         if (self.messages.items.len == 0) return;
         if (self.messages.items[self.messages.items.len - 1] != .assistant) return;
         _ = self.messages.pop();
+        self.session_manager.moveLeafToParent() catch |err| self.recordCallbackError(err);
     }
 
     fn hostClassifyUnexpectedStop(raw: *anyopaque, text: []const u8) ?bool {
@@ -711,6 +754,7 @@ pub const AgentSession = struct {
             .tool_choice = choice,
             .stop_when = &stop_conditions,
             .reasoning = reasoning,
+            .max_output_tokens = live.max_output_tokens,
             .max_retries = 0,
             .diag = &diagnostics,
             .on_error = .{ .callback = observeStreamError },
@@ -924,6 +968,13 @@ pub const AgentSession = struct {
             null;
         self.current_model = owned_target;
         self.current_model_role = owned_role;
+        const persisted_model = try std.fmt.allocPrint(
+            self.gpa,
+            "{s}/{s}",
+            .{ selection.provider, selection.model },
+        );
+        defer self.gpa.free(persisted_model);
+        _ = try self.session_manager.appendModelChange(persisted_model, selection.role);
     }
 
     fn liveCallSettings(self: *AgentSession) LiveCallSettings {
@@ -933,7 +984,52 @@ pub const AgentSession = struct {
             .system_prompt = self.system_prompt,
             .active_tools = self.active_tools,
             .thinking = self.thinking,
+            .max_output_tokens = self.max_output_tokens,
         };
+    }
+
+    fn restoreFromSession(self: *AgentSession) !void {
+        const arena = self.message_arena_state.allocator();
+        const path_entries = try self.session_manager.activePathAlloc(self.gpa);
+        defer self.gpa.free(path_entries);
+        var selected_model: ?[]const u8 = null;
+        var selected_role: ?[]const u8 = null;
+        var selected_thinking: ?catalog.ThinkingLevel = null;
+        for (path_entries) |entry| switch (entry) {
+            .message => |stored| {
+                const encoded = try message.stringifyAlloc(arena, stored.message);
+                try self.messages.append(arena, try message.parse(arena, encoded));
+            },
+            .model_change => |change| {
+                selected_model = change.model;
+                selected_role = change.role;
+            },
+            .thinking_level_change => |change| {
+                const configured = switch (change.configured) {
+                    .value => |value| value,
+                    else => switch (change.thinkingLevel) {
+                        .value => |value| value,
+                        else => null,
+                    },
+                };
+                if (configured) |value| selected_thinking = std.meta.stringToEnum(catalog.ThinkingLevel, value);
+            },
+            else => {},
+        };
+        if (selected_thinking) |value| self.thinking = value;
+        if (selected_model) |combined| {
+            if (std.mem.indexOfScalar(u8, combined, '/')) |separator| {
+                const provider_name = combined[0..separator];
+                const model_id = combined[separator + 1 ..];
+                if (self.resolve_model) |resolver| if (resolver.resolve_fn(resolver.ctx, provider_name, model_id)) |target| {
+                    self.current_model = try cloneTarget(self.config_arena_state.allocator(), target);
+                    self.current_model_role = if (selected_role) |role|
+                        try self.config_arena_state.allocator().dupe(u8, role)
+                    else
+                        null;
+                };
+            }
+        }
     }
 
     fn currentTarget(self: *AgentSession) ModelTarget {
@@ -1039,6 +1135,10 @@ pub const AgentSession = struct {
             return;
         };
         self.messages.append(self.message_arena_state.allocator(), .{ .assistant = assistant }) catch |err| {
+            self.recordCallbackError(err);
+            return;
+        };
+        _ = self.session_manager.appendMessage(.{ .assistant = assistant }) catch |err| {
             self.recordCallbackError(err);
             return;
         };
@@ -1428,11 +1528,202 @@ test "agent retry delay uses exact exponential defaults and cap" {
     );
 }
 
+fn exportEnvValue(contents: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        var line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.startsWith(u8, line, "export ")) {
+            line = std.mem.trim(u8, line["export ".len..], " \t");
+        }
+        const separator = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..separator], " \t"), name)) continue;
+        var value = std.mem.trim(u8, line[separator + 1 ..], " \t\r");
+        if (value.len >= 2 and
+            ((value[0] == '"' and value[value.len - 1] == '"') or
+                (value[0] == '\'' and value[value.len - 1] == '\'')))
+        {
+            value = value[1 .. value.len - 1];
+        }
+        return if (value.len == 0) null else value;
+    }
+    return null;
+}
+
+fn loadAnthropicApiKey(allocator: Allocator, io: std.Io) ![]u8 {
+    const env_path = "/home/autark/src/rctr/.env";
+    const file_contents = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        env_path,
+        allocator,
+        .limited(1024 * 1024),
+    ) catch null;
+    if (file_contents) |contents| {
+        defer allocator.free(contents);
+        if (exportEnvValue(contents, "ANTHROPIC_API_KEY")) |value| return allocator.dupe(u8, value);
+    }
+    return std.process.Environ.getAlloc(std.testing.environ, allocator, "ANTHROPIC_API_KEY") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => {
+            std.debug.print("live provider smoke requires ANTHROPIC_API_KEY in the configured env file or process environment\n", .{});
+            return error.AnthropicApiKeyUnavailable;
+        },
+        else => return err,
+    };
+}
+
+test "env file parser accepts export quotes comments and blanks" {
+    const fixture = "# comment\n\n export ANTHROPIC_API_KEY = \"quoted-value\"\nOTHER=value\n";
+    try std.testing.expectEqualStrings("quoted-value", exportEnvValue(fixture, "ANTHROPIC_API_KEY").?);
+    try std.testing.expect(exportEnvValue(fixture, "MISSING") == null);
+}
+
+test "live AgentSession Anthropic read-tool turn" {
+    if (!build_options.live) return error.SkipZigTest;
+
+    const anthropic = @import("anthropic");
+    const provider_utils_http = @import("provider_utils");
+    const read_tool = @import("../tools/read.zig");
+    const tool_state = @import("../tools/session_state.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const api_key = try loadAnthropicApiKey(allocator, io);
+    defer allocator.free(api_key);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "marker.txt", .data = "PI_ZIG_LIVE_MARKER\n" });
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_length = try tmp.dir.realPath(io, &cwd_buffer);
+    const cwd = cwd_buffer[0..cwd_length];
+    var state = try tool_state.SessionState.init(allocator, io, .{ .cwd = cwd });
+    defer state.deinit();
+    var registry = tool_api.ToolRegistry.init(allocator);
+    defer registry.deinit();
+    var declaration = read_tool.tool;
+    declaration.ctx = &state;
+    try registry.add(declaration);
+
+    var client = provider_utils_http.HttpClientTransport.init(allocator, io);
+    defer client.deinit();
+    const factory = try anthropic.createAnthropic(.{
+        .api_key = api_key,
+        .transport = client.transport(),
+    });
+    const model_id = "claude-haiku-4-5-20251001";
+    var chat = try factory.messages(model_id, null);
+    const ForceRead = struct {
+        calls: std.atomic.Value(u8) = .init(0),
+
+        fn resolve(raw: ?*anyopaque) ?loop.ToolChoiceDirective {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.calls.fetchAdd(1, .acq_rel) != 0) return null;
+            return .{ .hard = .{ .named = "read" } };
+        }
+    };
+    var force_read: ForceRead = .{};
+    var session = try AgentSession.init(allocator, io, .{
+        .model = .{
+            .language_model = .{ .model = chat.languageModel() },
+            .provider_name = "anthropic",
+            .model_id = model_id,
+            .api = "anthropic-messages",
+        },
+        .system_prompt = "Use the read tool for marker.txt. Then answer with the marker word from the file and no explanation.",
+        .tools = &registry,
+        .thinking = .off,
+        .tool_choice = .{ .ctx = &force_read, .resolve_fn = ForceRead.resolve },
+        .max_output_tokens = 128,
+    });
+    defer session.deinit();
+    var runner = io.async(AgentSession.run, .{&session});
+    var prompt = try events.OwnedPrompt.init(allocator, "Read marker.txt and return its marker word.", &.{}, false, .user);
+    defer prompt.deinit(allocator);
+    try session.inbox().push(io, .{ .prompt = prompt });
+
+    const Tag = std.meta.Tag(events.AgentEvent);
+    var tags: std.ArrayList(Tag) = .empty;
+    defer tags.deinit(allocator);
+    while (try session.outbox().pop(io)) |owned_event| {
+        var event = owned_event;
+        const tag = std.meta.activeTag(event);
+        try tags.append(allocator, tag);
+        const finished = tag == .run_finished;
+        event.deinit(allocator);
+        if (finished) break;
+    }
+    try session.inbox().push(io, .shutdown);
+    try runner.await(io);
+
+    var tool_call_count: usize = 0;
+    var paired_result_count: usize = 0;
+    var total_usage: message.Usage = .{};
+    var final_text: []const u8 = "";
+    for (session.messagesBorrowed()) |stored| switch (stored) {
+        .assistant => |assistant| {
+            for (assistant.content) |block| switch (block) {
+                .tool_call => |call| {
+                    tool_call_count += 1;
+                    for (session.messagesBorrowed()) |candidate| if (candidate == .tool_result and
+                        std.mem.eql(u8, candidate.tool_result.tool_call_id, call.id))
+                    {
+                        paired_result_count += 1;
+                        break;
+                    };
+                },
+                .text => |text| {
+                    if (text.text.len != 0) final_text = text.text;
+                },
+                else => {},
+            };
+            addTestUsage(&total_usage, assistant.usage);
+            const model = (try catalog.getBundledModel("anthropic", model_id)).?;
+            var recomputed = assistant.usage;
+            const expected_cost = catalog.calculateCost(model, &recomputed);
+            try std.testing.expectApproxEqAbs(expected_cost.total, assistant.usage.cost.total, 1e-12);
+        },
+        else => {},
+    };
+    try std.testing.expect(tool_call_count >= 1);
+    try std.testing.expectEqual(tool_call_count, paired_result_count);
+    try std.testing.expect(final_text.len != 0);
+    try std.testing.expect(std.mem.indexOf(u8, final_text, "PI_ZIG_LIVE_MARKER") != null);
+    try std.testing.expect(total_usage.input + total_usage.output + total_usage.cache_read + total_usage.cache_write > 0);
+    try expectOrderedTags(tags.items, &.{ .run_started, .tool_started, .tool_finished, .run_finished });
+}
+
+fn addTestUsage(total: *message.Usage, value: message.Usage) void {
+    total.input += value.input;
+    total.output += value.output;
+    total.cache_read += value.cache_read;
+    total.cache_write += value.cache_write;
+}
+
+fn expectOrderedTags(actual: []const std.meta.Tag(events.AgentEvent), expected: []const std.meta.Tag(events.AgentEvent)) !void {
+    var index: usize = 0;
+    for (actual) |tag| if (index < expected.len and tag == expected[index]) {
+        index += 1;
+    };
+    try std.testing.expectEqual(expected.len, index);
+}
+
 test "loop integration runs one model step at a time around a client tool" {
     const openai_compatible = @import("openai_compatible");
     const mock_transport = @import("../testkit/mock_transport.zig");
     const io = std.testing.io;
     const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var temp_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const temp_path_length = try tmp.dir.realPath(io, &temp_path_buffer);
+    const temp_root = temp_path_buffer[0..temp_path_length];
+    var persistent = try session_manager.SessionManager.create(allocator, io, temp_root, .{
+        .path_options = .{
+            .agent_dir = temp_root,
+            .home = temp_root,
+            .temp_dir = "/tmp",
+        },
+    });
+    defer persistent.deinit();
     const tool_sse =
         "data: {\"id\":\"chatcmpl-tool\",\"created\":1711115037,\"model\":\"smoke-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"value\\\":\\\"hello\\\"}\"}}]}}]}\n\n" ++
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n" ++
@@ -1500,6 +1791,7 @@ test "loop integration runs one model step at a time around a client tool" {
         },
         .system_prompt = "You are helpful.",
         .tools = &registry,
+        .session_manager = &persistent,
     });
     defer session.deinit();
     var runner = io.async(AgentSession.run, .{&session});
@@ -1529,6 +1821,26 @@ test "loop integration runs one model step at a time around a client tool" {
     try std.testing.expect(session.messagesBorrowed()[2] == .tool_result);
     try std.testing.expectEqualStrings("echoed: hello", session.messagesBorrowed()[2].tool_result.content[0].text.text);
     try std.testing.expectEqualStrings("done", session.messagesBorrowed()[3].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 4), persistent.getEntries().len);
+    try persistent.flush();
+    var reopened = try session_manager.SessionManager.open(allocator, io, persistent.path().?, .{
+        .path_options = .{
+            .agent_dir = temp_root,
+            .home = temp_root,
+            .temp_dir = "/tmp",
+        },
+    });
+    defer reopened.deinit();
+    try std.testing.expectEqual(persistent.getEntries().len, reopened.getEntries().len);
+    try std.testing.expectEqualStrings(persistent.currentLeaf().?, reopened.currentLeaf().?);
+    try std.testing.expectEqual(persistent.usageTotals().input, reopened.usageTotals().input);
+    for (persistent.getEntries(), reopened.getEntries()) |expected, actual| {
+        const expected_json = try @import("../session/entries.zig").stringifyEntryAlloc(allocator, expected);
+        defer allocator.free(expected_json);
+        const actual_json = try @import("../session/entries.zig").stringifyEntryAlloc(allocator, actual);
+        defer allocator.free(actual_json);
+        try std.testing.expectEqualStrings(expected_json, actual_json);
+    }
     const expected_tags = [_]Tag{
         .run_started,
         .turn_started,
@@ -1551,6 +1863,56 @@ test "loop integration runs one model step at a time around a client tool" {
         .run_finished,
     };
     try std.testing.expectEqualSlices(Tag, &expected_tags, tags.items);
+
+    const resume_sse =
+        "data: {\"id\":\"chatcmpl-resume\",\"created\":1711115039,\"model\":\"smoke-model\",\"choices\":[{\"delta\":{\"content\":\"resumed\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":1,\"total_tokens\":13}}\n\n" ++
+        "data: [DONE]\n\n";
+    const resume_script = [_]mock_transport.ScriptedResponse{.{ .sse = resume_sse }};
+    const ResumeObserver = struct {
+        saw_prior_turn: std.atomic.Value(bool) = .init(false),
+
+        fn observe(raw: ?*anyopaque, _: usize, body: ?[]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const request = body orelse return;
+            self.saw_prior_turn.store(
+                std.mem.indexOf(u8, request, "done") != null and
+                    std.mem.indexOf(u8, request, "echoed: hello") != null,
+                .release,
+            );
+        }
+    };
+    var resume_observer: ResumeObserver = .{};
+    var resume_mock = mock_transport.MockTransport.init(&resume_script);
+    resume_mock.observer = .{ .ctx = &resume_observer, .observe_fn = ResumeObserver.observe };
+    const resume_factory = openai_compatible.createOpenAiCompatible(.{
+        .provider_name = "phase-1b",
+        .base_url = "https://example.test/v1",
+        .api_key = "dummy-key",
+        .transport = resume_mock.transport(),
+    });
+    var resume_chat = try resume_factory.chatModel("smoke-model", null);
+    var resumed = try AgentSession.init(allocator, io, .{
+        .model = .{
+            .language_model = .{ .model = resume_chat.languageModel() },
+            .provider_name = "phase-1b",
+            .model_id = "smoke-model",
+            .api = "openai-compatible",
+        },
+        .tools = &registry,
+        .session_manager = &reopened,
+    });
+    defer resumed.deinit();
+    try std.testing.expectEqual(@as(usize, 4), resumed.messagesBorrowed().len);
+    var resumed_runner = io.async(AgentSession.run, .{&resumed});
+    var resume_prompt = try events.OwnedPrompt.init(allocator, "continue", &.{}, false, .user);
+    defer resume_prompt.deinit(allocator);
+    try resumed.inbox().push(io, .{ .prompt = resume_prompt });
+    try drainRun(io, allocator, &resumed);
+    try resumed.inbox().push(io, .shutdown);
+    try resumed_runner.await(io);
+    try std.testing.expect(resume_observer.saw_prior_turn.load(.acquire));
+    try std.testing.expectEqualStrings("resumed", resumed.messagesBorrowed()[5].assistant.content[0].text.text);
 }
 
 test "loop integration blocks an exec tool until the approval command" {

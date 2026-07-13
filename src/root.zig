@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const build_options = @import("build_options");
+
 pub const core = @import("core/core.zig");
 pub const session = @import("session/session.zig");
 pub const tools = @import("tools/tools.zig");

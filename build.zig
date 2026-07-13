@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
         "test-filter",
         "Run tests whose names contain any of these substrings",
     ) orelse &.{};
-    _ = b.option(bool, "live", "Run live provider smoke tests") orelse false;
+    const live = b.option(bool, "live", "Run live provider smoke tests") orelse false;
 
     const ai_dep = b.dependency("ai", .{
         .target = target,
@@ -49,6 +49,21 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", build_zon.version);
+    build_options.addOption(bool, "live", live);
+
+    const crash_helper_module = b.createModule(.{
+        .root_source_file = b.path("src/session_crash_helper.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addDependencyImports(crash_helper_module, deps);
+    const crash_helper = b.addExecutable(.{
+        .name = "session-crash-helper",
+        .root_module = crash_helper_module,
+        .use_llvm = true,
+    });
+    build_options.addOptionPath("session_crash_helper_path", crash_helper.getEmittedBin());
+    pi.addOptions("build_options", build_options);
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -56,7 +71,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_module.addImport("pi", pi);
-    exe_module.addOptions("build_options", build_options);
     addDependencyImports(exe_module, deps);
     exe_module.linkLibrary(quickjs_lib);
 
