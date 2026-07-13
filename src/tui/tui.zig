@@ -1,13 +1,17 @@
 //! Interactive terminal frontend over the agent mailbox contract.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const openai_compatible = @import("openai_compatible");
 const tuizr = @import("tuizr");
 const catalog = @import("../catalog/types.zig");
+const model_catalog = @import("../catalog/models.zig");
 const agent = @import("../core/agent.zig");
 const events = @import("../core/events.zig");
 const tool_api = @import("../core/tool.zig");
 const testkit = @import("../testkit/mock_transport.zig");
+const autocomplete = @import("autocomplete.zig");
+const slash = @import("slash.zig");
 
 const Allocator = std.mem.Allocator;
 const double_ctrl_c_ms: i64 = 500;
@@ -18,6 +22,19 @@ const max_tool_call_id_bytes: usize = 256;
 const max_tool_name_bytes: usize = 256;
 const max_buffered_tool_output_bytes: usize = 8 * 1024;
 const buffered_tool_output_truncation_marker = "…[output truncated]";
+const shell_timeout_seconds: i64 = 10;
+const max_shell_output_bytes: usize = 64 * 1024;
+
+const thinking_level_names = [_][]const u8{
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+};
 
 const transcript_theme: tuizr.TranscriptTheme = .{
     .markdown = .{
@@ -181,6 +198,42 @@ const InFlightToolCall = struct {
     }
 };
 
+const AutocompletePopup = struct {
+    visible: bool = false,
+    completions: autocomplete.Completions = .{},
+    item_views: [autocomplete.max_items][]const u8 = undefined,
+    selected: usize = 0,
+
+    fn set(self: *AutocompletePopup, completions: autocomplete.Completions) void {
+        self.completions = completions;
+        self.selected = 0;
+        self.visible = completions.count != 0;
+        for (self.completions.items[0..self.completions.count], 0..) |*item, index| {
+            self.item_views[index] = item.label();
+        }
+    }
+
+    fn hide(self: *AutocompletePopup) void {
+        self.visible = false;
+        self.selected = 0;
+    }
+
+    fn previous(self: *AutocompletePopup) void {
+        if (self.completions.count == 0) return;
+        self.selected = if (self.selected == 0) self.completions.count - 1 else self.selected - 1;
+    }
+
+    fn next(self: *AutocompletePopup) void {
+        if (self.completions.count == 0) return;
+        self.selected = (self.selected + 1) % self.completions.count;
+    }
+
+    fn selectedItem(self: *const AutocompletePopup) ?*const autocomplete.Item {
+        if (!self.visible or self.completions.count == 0) return null;
+        return &self.completions.items[@min(self.selected, self.completions.count - 1)];
+    }
+};
+
 const State = struct {
     transcript: tuizr.Transcript = .{},
     current_kind: ?tuizr.BlockKind = null,
@@ -195,13 +248,57 @@ const State = struct {
     transcript_viewport_height: u16 = 0,
     quit_requested: bool = false,
     last_ctrl_c_ms: ?i64 = null,
+    popup: AutocompletePopup = .{},
+    registry: ?model_catalog.Registry = null,
+    model_ids: []const []const u8 = &.{},
+    effort_names: []const []const u8 = &thinking_level_names,
 
     fn init() State {
         var composer = tuizr.TextInput.init();
         composer.multiline = true;
         return .{ .composer = composer };
     }
+
+    fn initCatalog(self: *State, allocator: Allocator) !void {
+        self.registry = try model_catalog.Registry.init(allocator);
+        errdefer {
+            self.registry.?.deinit();
+            self.registry = null;
+        }
+        self.model_ids = try collectModelIds(allocator, &self.registry.?);
+    }
+
+    fn deinit(self: *State, allocator: Allocator) void {
+        if (self.model_ids.len != 0) allocator.free(self.model_ids);
+        if (self.registry) |*registry| registry.deinit();
+        self.registry = null;
+        self.model_ids = &.{};
+    }
 };
+
+fn collectModelIds(allocator: Allocator, registry: *const model_catalog.Registry) ![]const []const u8 {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+    var result: std.ArrayList([]const u8) = .empty;
+    defer result.deinit(allocator);
+
+    var provider_iterator = registry.providers.iterator();
+    while (provider_iterator.next()) |provider_entry| {
+        var model_iterator = provider_entry.value_ptr.iterator();
+        while (model_iterator.next()) |model_entry| {
+            const model_id = model_entry.key_ptr.*;
+            if (seen.contains(model_id)) continue;
+            try seen.put(allocator, model_id, {});
+            try result.append(allocator, model_id);
+        }
+    }
+    std.mem.sort([]const u8, result.items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.order(u8, lhs, rhs) == .lt;
+        }
+    }.lessThan);
+    return result.toOwnedSlice(allocator);
+}
 
 fn ensureBlock(state: *State, kind: tuizr.BlockKind) void {
     if (state.current_kind == kind) return;
@@ -333,6 +430,8 @@ pub fn run(
     const state = try gpa.create(State);
     defer gpa.destroy(state);
     state.* = State.init();
+    try state.initCatalog(gpa);
+    defer state.deinit(gpa);
 
     for (initial_prompts) |text| {
         try pushPrompt(gpa, io, session, text);
@@ -480,6 +579,7 @@ fn handleKey(
             }
         }
         clearComposer(&state.composer);
+        state.popup.hide();
         state.last_ctrl_c_ms = now_ms;
         return;
     }
@@ -493,7 +593,36 @@ fn handleKey(
     }
 
     if (key_event.key == .escape) {
-        try session.inbox().push(io, .{ .cancel = .user });
+        if (state.popup.visible) {
+            state.popup.hide();
+        } else if (state.is_running) {
+            try session.inbox().push(io, .{ .cancel = .user });
+        }
+        return;
+    }
+
+    if (state.popup.visible) {
+        if (key_event.key == .up or isCtrlCharacter(key_event, 'p')) {
+            state.popup.previous();
+            return;
+        }
+        if (key_event.key == .down or isCtrlCharacter(key_event, 'n')) {
+            state.popup.next();
+            return;
+        }
+        if (key_event.key == .tab or key_event.key == .enter) {
+            acceptCompletion(io, state);
+            return;
+        }
+    }
+
+    if (key_event.key == .up and key_event.modifiers.alt) {
+        try session.inbox().push(io, .dequeue_last);
+        return;
+    }
+
+    if ((key_event.key == .enter and key_event.modifiers.ctrl) or isCtrlCharacter(key_event, 'q')) {
+        try submitComposer(gpa, io, session, state, .follow_up);
         return;
     }
 
@@ -520,19 +649,375 @@ fn handleKey(
     }
 
     if (key_event.key == .enter and !key_event.modifiers.shift) {
-        if (tuizr.textInputHandleKey(&state.composer, key_event)) |submitted| {
-            if (submitted.len != 0) {
-                try pushPrompt(gpa, io, session, submitted);
-                tuizr.transcriptStartBlock(&state.transcript, .user);
-                tuizr.transcriptAppend(&state.transcript, submitted);
-                tuizr.transcriptFinalize(&state.transcript);
-                state.current_kind = null;
-            }
-        }
+        try submitComposer(gpa, io, session, state, null);
+        return;
+    }
+
+    if (key_event.key == .tab) {
+        recomputeAutocomplete(io, state, true);
         return;
     }
 
     _ = tuizr.textInputHandleKey(&state.composer, key_event);
+    recomputeAutocomplete(io, state, false);
+}
+
+const PromptRoute = enum {
+    prompt,
+    steer,
+    follow_up,
+};
+
+fn isCtrlCharacter(key_event: tuizr.KeyEvent, expected: u21) bool {
+    return key_event.modifiers.ctrl and
+        (key_event.codepoint == expected or key_event.codepoint == expected - 'a' + 'A');
+}
+
+fn recomputeAutocomplete(io: std.Io, state: *State, force_file: bool) void {
+    const before_cursor = state.composer.buffer[0..state.composer.cursor];
+    const cwd: autocomplete.WorkingDirectory = .{
+        .io = io,
+        .home = defaultHomeDirectory(),
+    };
+    const completions = if (force_file)
+        autocomplete.computeCompletionsForced(
+            before_cursor,
+            &slash.commands,
+            state.model_ids,
+            state.effort_names,
+            cwd,
+        )
+    else
+        autocomplete.computeCompletions(
+            before_cursor,
+            &slash.commands,
+            state.model_ids,
+            state.effort_names,
+            cwd,
+        );
+    state.popup.set(completions);
+}
+
+fn acceptCompletion(io: std.Io, state: *State) void {
+    const item = state.popup.selectedItem() orelse return;
+    const span = state.popup.completions.replacement;
+    if (span.start > span.end or span.end > state.composer.len) {
+        state.popup.hide();
+        return;
+    }
+
+    const append_space = item.kind == .command and item.consumes_args;
+    const replacement_len = item.value().len + @intFromBool(append_space);
+    const replaced_len = span.end - span.start;
+    const new_len = state.composer.len - replaced_len + replacement_len;
+    if (new_len > @min(state.composer.max_len, state.composer.buffer.len)) {
+        state.popup.hide();
+        return;
+    }
+
+    const suffix = state.composer.buffer[span.end..state.composer.len];
+    if (replacement_len > replaced_len) {
+        std.mem.copyBackwards(
+            u8,
+            state.composer.buffer[span.start + replacement_len .. new_len],
+            suffix,
+        );
+    } else if (replacement_len < replaced_len) {
+        std.mem.copyForwards(
+            u8,
+            state.composer.buffer[span.start + replacement_len .. new_len],
+            suffix,
+        );
+    }
+    @memcpy(
+        state.composer.buffer[span.start .. span.start + item.value().len],
+        item.value(),
+    );
+    if (append_space) state.composer.buffer[span.start + item.value().len] = ' ';
+    state.composer.len = new_len;
+    state.composer.cursor = span.start + replacement_len;
+    state.composer.history_idx = null;
+    state.composer.saved_len = 0;
+    state.composer.submitted_len = 0;
+
+    const continue_completion = append_space or (item.kind == .file and item.is_directory);
+    state.popup.hide();
+    if (continue_completion) recomputeAutocomplete(io, state, false);
+}
+
+fn submitComposer(
+    gpa: Allocator,
+    io: std.Io,
+    session: *agent.AgentSession,
+    state: *State,
+    forced_route: ?PromptRoute,
+) !void {
+    const submit_key: tuizr.KeyEvent = .{ .key = .enter, .codepoint = 0 };
+    const submitted = tuizr.textInputHandleKey(&state.composer, submit_key) orelse return;
+    state.popup.hide();
+    const trimmed = std.mem.trim(u8, submitted, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    if (forced_route) |route| {
+        try pushAgentPrompt(gpa, io, session, route, trimmed);
+        appendTranscriptBlock(state, .user, trimmed);
+        return;
+    }
+    try dispatchSubmission(gpa, io, session, state, trimmed);
+}
+
+fn dispatchSubmission(
+    gpa: Allocator,
+    io: std.Io,
+    session: *agent.AgentSession,
+    state: *State,
+    submitted: []const u8,
+) !void {
+    if (submitted[0] == '/') {
+        try dispatchSlash(gpa, io, session, state, slash.parse(submitted));
+        return;
+    }
+    if (std.mem.startsWith(u8, submitted, "!!")) {
+        try dispatchShell(gpa, io, session, state, submitted[2..], true);
+        return;
+    }
+    if (submitted[0] == '!') {
+        try dispatchShell(gpa, io, session, state, submitted[1..], false);
+        return;
+    }
+    if (std.mem.startsWith(u8, submitted, "->") or std.mem.startsWith(u8, submitted, "=>")) {
+        const text = std.mem.trim(u8, submitted[2..], " \t\r\n");
+        if (text.len != 0) {
+            try pushAgentPrompt(gpa, io, session, .follow_up, text);
+            appendTranscriptBlock(state, .user, text);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, submitted, ".") or std.mem.eql(u8, submitted, "c")) {
+        try pushAgentPrompt(gpa, io, session, .prompt, "continue");
+        appendTranscriptBlock(state, .user, "continue");
+        return;
+    }
+
+    const route: PromptRoute = if (state.is_running) .steer else .prompt;
+    try pushAgentPrompt(gpa, io, session, route, submitted);
+    appendTranscriptBlock(state, .user, submitted);
+}
+
+fn dispatchSlash(
+    gpa: Allocator,
+    io: std.Io,
+    session: *agent.AgentSession,
+    state: *State,
+    parsed: slash.ParseResult,
+) !void {
+    const matched = switch (parsed) {
+        .command => |value| value,
+        .bare, .unknown => {
+            appendNotice(state, "unknown command");
+            return;
+        },
+        .not_command => return,
+    };
+    const name = matched.command.name;
+
+    if (std.mem.eql(u8, name, "/help")) {
+        appendCommandHelp(state);
+    } else if (std.mem.eql(u8, name, "/model")) {
+        if (matched.args.len == 0) {
+            appendNotice(state, "model id required");
+            return;
+        }
+        const registry = if (state.registry) |*value| value else {
+            appendNotice(state, "unknown model");
+            return;
+        };
+        const provider_name = findModelProvider(registry, matched.args) orelse {
+            appendNotice(state, "unknown model");
+            return;
+        };
+        var selection = try events.ModelSelection.init(gpa, provider_name, matched.args, null);
+        defer selection.deinit(gpa);
+        try session.inbox().push(io, .{ .change_model = selection });
+    } else if (std.mem.eql(u8, name, "/thinking")) {
+        const level = std.meta.stringToEnum(catalog.ThinkingLevel, matched.args) orelse {
+            appendNotice(state, "invalid thinking level");
+            return;
+        };
+        try session.inbox().push(io, .{ .change_thinking = level });
+    } else if (std.mem.eql(u8, name, "/compact")) {
+        try session.inbox().push(io, .{ .compact = null });
+    } else if (std.mem.eql(u8, name, "/retry")) {
+        try session.inbox().push(io, .retry);
+    } else if (std.mem.eql(u8, name, "/clear")) {
+        tuizr.transcriptClear(&state.transcript);
+        state.current_kind = null;
+        appendNotice(state, "on-screen view was cleared");
+    } else if (std.mem.eql(u8, name, "/exit")) {
+        state.quit_requested = true;
+    } else if (std.mem.eql(u8, name, "/login")) {
+        appendNotice(state, "OAuth login lands next");
+    }
+}
+
+fn findModelProvider(registry: *const model_catalog.Registry, model_id: []const u8) ?[]const u8 {
+    var provider_iterator = registry.providers.iterator();
+    while (provider_iterator.next()) |provider_entry| {
+        if (provider_entry.value_ptr.get(model_id) != null) return provider_entry.key_ptr.*;
+    }
+    return null;
+}
+
+fn dispatchShell(
+    gpa: Allocator,
+    io: std.Io,
+    session: *agent.AgentSession,
+    state: *State,
+    raw_command: []const u8,
+    send_to_model: bool,
+) !void {
+    const command = std.mem.trim(u8, raw_command, " \t\r\n");
+    if (command.len == 0) {
+        appendNotice(state, "shell command required");
+        return;
+    }
+
+    const output = try runShellCommand(gpa, io, command);
+    defer gpa.free(output);
+    const message = try std.fmt.allocPrint(gpa, "$ {s}\n{s}", .{ command, output });
+    defer gpa.free(message);
+    appendTranscriptBlock(state, .tool, message);
+    if (send_to_model) {
+        const route: PromptRoute = if (state.is_running) .steer else .prompt;
+        try pushAgentPrompt(gpa, io, session, route, message);
+    }
+}
+
+fn runShellCommand(gpa: Allocator, io: std.Io, command: []const u8) ![]u8 {
+    const timeout: std.Io.Timeout = .{ .deadline = .fromNow(io, .{
+        .raw = .fromSeconds(shell_timeout_seconds),
+        .clock = .awake,
+    }) };
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ defaultShell(), "-c", command },
+        .stdout_limit = .limited(max_shell_output_bytes / 2),
+        .stderr_limit = .limited(max_shell_output_bytes / 2),
+        .reserve_amount = 4096,
+        .timeout = timeout,
+    }) catch |err| switch (err) {
+        error.Timeout => return std.fmt.allocPrint(
+            gpa,
+            "Command timed out after {d} seconds",
+            .{shell_timeout_seconds},
+        ),
+        error.StreamTooLong => return std.fmt.allocPrint(
+            gpa,
+            "Command output exceeded {d} bytes",
+            .{max_shell_output_bytes},
+        ),
+        else => return std.fmt.allocPrint(gpa, "Command failed: {s}", .{@errorName(err)}),
+    };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(gpa);
+    try output.appendSlice(gpa, result.stdout);
+    if (result.stderr.len != 0) {
+        if (output.items.len != 0 and output.items[output.items.len - 1] != '\n') {
+            try output.append(gpa, '\n');
+        }
+        try output.appendSlice(gpa, result.stderr);
+    }
+    if (output.items.len == 0) try output.appendSlice(gpa, "(no output)");
+
+    var status_buffer: [128]u8 = undefined;
+    const status: ?[]const u8 = switch (result.term) {
+        .exited => |code| if (code == 0)
+            null
+        else
+            try std.fmt.bufPrint(&status_buffer, "\n\nCommand exited with code {d}", .{code}),
+        .signal => |signal| try std.fmt.bufPrint(
+            &status_buffer,
+            "\n\nCommand terminated by signal {d}",
+            .{signal},
+        ),
+        .stopped => |signal| try std.fmt.bufPrint(
+            &status_buffer,
+            "\n\nCommand stopped by signal {d}",
+            .{signal},
+        ),
+        .unknown => |value| try std.fmt.bufPrint(
+            &status_buffer,
+            "\n\nCommand ended with status {d}",
+            .{value},
+        ),
+    };
+    if (status) |text| try output.appendSlice(gpa, text);
+    return output.toOwnedSlice(gpa);
+}
+
+fn defaultShell() []const u8 {
+    if (comptime builtin.link_libc and builtin.os.tag != .windows) {
+        if (std.c.getenv("SHELL")) |value| {
+            const shell = std.mem.span(value);
+            if (shell.len != 0) return shell;
+        }
+    }
+    return if (builtin.os.tag == .windows) "cmd.exe" else "/bin/sh";
+}
+
+fn defaultHomeDirectory() ?[]const u8 {
+    if (comptime builtin.link_libc) {
+        const name = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+        if (std.c.getenv(name)) |value| {
+            const home = std.mem.span(value);
+            if (home.len != 0) return home;
+        }
+    }
+    return null;
+}
+
+fn appendCommandHelp(state: *State) void {
+    tuizr.transcriptStartBlock(&state.transcript, .notice);
+    for (slash.commands, 0..) |command, index| {
+        if (index != 0) tuizr.transcriptAppend(&state.transcript, "\n");
+        tuizr.transcriptAppend(&state.transcript, command.name);
+        if (std.mem.eql(u8, command.name, "/exit")) {
+            tuizr.transcriptAppend(&state.transcript, " (/quit)");
+        }
+        tuizr.transcriptAppend(&state.transcript, " — ");
+        tuizr.transcriptAppend(&state.transcript, command.summary);
+    }
+    tuizr.transcriptFinalize(&state.transcript);
+    state.current_kind = null;
+}
+
+fn appendNotice(state: *State, text: []const u8) void {
+    appendTranscriptBlock(state, .notice, text);
+}
+
+fn appendTranscriptBlock(state: *State, kind: tuizr.BlockKind, text: []const u8) void {
+    tuizr.transcriptStartBlock(&state.transcript, kind);
+    tuizr.transcriptAppend(&state.transcript, text);
+    tuizr.transcriptFinalize(&state.transcript);
+    state.current_kind = null;
+}
+
+fn pushAgentPrompt(
+    gpa: Allocator,
+    io: std.Io,
+    session: *agent.AgentSession,
+    route: PromptRoute,
+    text: []const u8,
+) !void {
+    var prompt = try events.OwnedPrompt.init(gpa, text, &.{}, false, .user);
+    defer prompt.deinit(gpa);
+    switch (route) {
+        .prompt => try session.inbox().push(io, .{ .prompt = prompt }),
+        .steer => try session.inbox().push(io, .{ .steer = prompt }),
+        .follow_up => try session.inbox().push(io, .{ .follow_up = prompt }),
+    }
 }
 
 fn pushPrompt(
@@ -541,9 +1026,7 @@ fn pushPrompt(
     session: *agent.AgentSession,
     text: []const u8,
 ) !void {
-    var prompt = try events.OwnedPrompt.init(gpa, text, &.{}, false, .user);
-    defer prompt.deinit(gpa);
-    try session.inbox().push(io, .{ .prompt = prompt });
+    try pushAgentPrompt(gpa, io, session, .prompt, text);
 }
 
 fn clearComposer(composer: *tuizr.TextInput) void {
@@ -668,6 +1151,27 @@ fn draw(
         );
     }
 
+    if (state.popup.visible and layout.composer_y != 0 and width != 0) {
+        const popup_height: u16 = @intCast(@min(
+            state.popup.completions.count,
+            @as(usize, layout.composer_y),
+        ));
+        if (popup_height != 0) {
+            tuizr.drawPopupList(
+                grid,
+                .{
+                    .x = 0,
+                    .y = layout.composer_y - popup_height,
+                    .w = width,
+                    .h = popup_height,
+                },
+                state.popup.item_views[0..state.popup.completions.count],
+                state.popup.selected,
+                .{},
+            );
+        }
+    }
+
     var left_buffer: [256]u8 = undefined;
     const left = formatStatusLeft(&left_buffer, state);
     var right_buffer: [512]u8 = undefined;
@@ -703,6 +1207,10 @@ fn keyCtrlC(event_type: tuizr.EventType) tuizr.KeyEvent {
         .modifiers = .{ .ctrl = true },
         .event_type = event_type,
     };
+}
+
+fn insertComposerText(composer: *tuizr.TextInput, text: []const u8) void {
+    for (text) |byte| _ = tuizr.textInputHandleKey(composer, keyCharacter(byte));
 }
 
 fn applyConsecutiveAssistantScript(allocator: Allocator, state: *State) !void {
@@ -1399,4 +1907,324 @@ test "Ctrl+D codepoint requests a normal quit" {
     try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &state, clock, ctrl_d);
     try std.testing.expect(state.quit_requested);
     try std.testing.expect(fixture.session.inbox().tryPop(std.testing.io) == null);
+}
+
+test "typing and accepting a slash completion preserves the completed composer" {
+    const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
+    defer fixture.deinit();
+    var state = State.init();
+    var now_ms: i64 = 0;
+    const clock: Clock = .{ .fixed_ms = &now_ms };
+
+    for ("/mo") |byte| {
+        try handleKey(
+            std.testing.allocator,
+            std.testing.io,
+            &fixture.session,
+            &state,
+            clock,
+            keyCharacter(byte),
+        );
+    }
+
+    try std.testing.expect(state.popup.visible);
+    const selected = state.popup.selectedItem() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("/model", selected.value());
+
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &state,
+        clock,
+        keyNamed(.enter),
+    );
+    try std.testing.expectEqualStrings("/model ", state.composer.buffer[0..state.composer.len]);
+    try std.testing.expectEqual(@as(usize, 7), state.composer.cursor);
+    try std.testing.expect(fixture.session.inbox().tryPop(std.testing.io) == null);
+}
+
+test "Escape closes autocomplete before it can cancel a running turn" {
+    const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
+    defer fixture.deinit();
+    var state = State.init();
+    var now_ms: i64 = 0;
+    const clock: Clock = .{ .fixed_ms = &now_ms };
+
+    state.is_running = true;
+    for ("/mo") |byte| {
+        try handleKey(
+            std.testing.allocator,
+            std.testing.io,
+            &fixture.session,
+            &state,
+            clock,
+            keyCharacter(byte),
+        );
+    }
+    try std.testing.expect(state.popup.visible);
+
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &state,
+        clock,
+        keyNamed(.escape),
+    );
+    try std.testing.expect(!state.popup.visible);
+    try std.testing.expectEqualStrings("/mo", state.composer.buffer[0..state.composer.len]);
+    try std.testing.expect(fixture.session.inbox().tryPop(std.testing.io) == null);
+
+    var idle_state = State.init();
+    insertComposerText(&idle_state.composer, "draft");
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &idle_state,
+        clock,
+        keyNamed(.escape),
+    );
+    try std.testing.expectEqualStrings("draft", idle_state.composer.buffer[0..idle_state.composer.len]);
+    try std.testing.expect(fixture.session.inbox().tryPop(std.testing.io) == null);
+}
+
+test "streaming Enter Ctrl Enter Ctrl Q and Alt Up route to distinct commands" {
+    const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
+    defer fixture.deinit();
+    var now_ms: i64 = 0;
+    const clock: Clock = .{ .fixed_ms = &now_ms };
+
+    var streaming = State.init();
+    streaming.is_running = true;
+    insertComposerText(&streaming.composer, "fix now");
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &streaming,
+        clock,
+        keyNamed(.enter),
+    );
+    var steer = fixture.session.inbox().tryPop(std.testing.io) orelse
+        return error.TestUnexpectedResult;
+    defer steer.deinit(std.testing.allocator);
+    try std.testing.expect(steer == .steer);
+    try std.testing.expectEqualStrings("fix now", steer.steer.text);
+
+    var ctrl_enter_state = State.init();
+    insertComposerText(&ctrl_enter_state.composer, "after this");
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &ctrl_enter_state,
+        clock,
+        .{ .key = .enter, .codepoint = 0, .modifiers = .{ .ctrl = true } },
+    );
+    var follow_up = fixture.session.inbox().tryPop(std.testing.io) orelse
+        return error.TestUnexpectedResult;
+    defer follow_up.deinit(std.testing.allocator);
+    try std.testing.expect(follow_up == .follow_up);
+    try std.testing.expectEqualStrings("after this", follow_up.follow_up.text);
+
+    var ctrl_q_state = State.init();
+    insertComposerText(&ctrl_q_state.composer, "also later");
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &ctrl_q_state,
+        clock,
+        .{ .key = .character, .codepoint = 'q', .modifiers = .{ .ctrl = true } },
+    );
+    var ctrl_q = fixture.session.inbox().tryPop(std.testing.io) orelse
+        return error.TestUnexpectedResult;
+    defer ctrl_q.deinit(std.testing.allocator);
+    try std.testing.expect(ctrl_q == .follow_up);
+    try std.testing.expectEqualStrings("also later", ctrl_q.follow_up.text);
+
+    var dequeue_state = State.init();
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &dequeue_state,
+        clock,
+        .{ .key = .up, .codepoint = 0, .modifiers = .{ .alt = true } },
+    );
+    var dequeue = fixture.session.inbox().tryPop(std.testing.io) orelse
+        return error.TestUnexpectedResult;
+    defer dequeue.deinit(std.testing.allocator);
+    try std.testing.expect(dequeue == .dequeue_last);
+}
+
+test "slash queue and continue submissions dispatch their classified commands" {
+    const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
+    defer fixture.deinit();
+    var now_ms: i64 = 0;
+    const clock: Clock = .{ .fixed_ms = &now_ms };
+
+    var thinking_state = State.init();
+    insertComposerText(&thinking_state.composer, "/thinking max");
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &thinking_state,
+        clock,
+        keyNamed(.enter),
+    );
+    var thinking = fixture.session.inbox().tryPop(std.testing.io) orelse
+        return error.TestUnexpectedResult;
+    defer thinking.deinit(std.testing.allocator);
+    try std.testing.expect(thinking == .change_thinking);
+    try std.testing.expect(thinking.change_thinking == .max);
+
+    var queue_state = State.init();
+    insertComposerText(&queue_state.composer, "->fix it");
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &queue_state,
+        clock,
+        keyNamed(.enter),
+    );
+    var queued = fixture.session.inbox().tryPop(std.testing.io) orelse
+        return error.TestUnexpectedResult;
+    defer queued.deinit(std.testing.allocator);
+    try std.testing.expect(queued == .follow_up);
+    try std.testing.expectEqualStrings("fix it", queued.follow_up.text);
+
+    var continue_state = State.init();
+    insertComposerText(&continue_state.composer, ".");
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &continue_state,
+        clock,
+        keyNamed(.enter),
+    );
+    var continued = fixture.session.inbox().tryPop(std.testing.io) orelse
+        return error.TestUnexpectedResult;
+    defer continued.deinit(std.testing.allocator);
+    try std.testing.expect(continued == .prompt);
+    try std.testing.expectEqualStrings("continue", continued.prompt.text);
+
+    var unknown_state = State.init();
+    insertComposerText(&unknown_state.composer, "/nope");
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &unknown_state,
+        clock,
+        keyNamed(.enter),
+    );
+    try std.testing.expect(fixture.session.inbox().tryPop(std.testing.io) == null);
+    try std.testing.expectEqual(@as(usize, 1), unknown_state.transcript.block_count);
+    try std.testing.expectEqual(tuizr.BlockKind.notice, unknown_state.transcript.blocks[0].kind);
+    try std.testing.expectEqualStrings(
+        "unknown command",
+        transcriptBlockContent(&unknown_state.transcript, 0),
+    );
+}
+
+test "model command resolves a provider from the startup catalog" {
+    const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
+    defer fixture.deinit();
+    var state = State.init();
+    try state.initCatalog(std.testing.allocator);
+    defer state.deinit(std.testing.allocator);
+
+    try dispatchSubmission(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &state,
+        "/model gpt-5.2",
+    );
+    var command = fixture.session.inbox().tryPop(std.testing.io) orelse
+        return error.TestUnexpectedResult;
+    defer command.deinit(std.testing.allocator);
+    try std.testing.expect(command == .change_model);
+    try std.testing.expectEqualStrings("gpt-5.2", command.change_model.model);
+    try std.testing.expect(command.change_model.provider.len != 0);
+}
+
+test "shell sigils separate local output from model-visible output" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
+    defer fixture.deinit();
+
+    var local_state = State.init();
+    try dispatchSubmission(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &local_state,
+        "!printf local",
+    );
+    try std.testing.expect(fixture.session.inbox().tryPop(std.testing.io) == null);
+    try std.testing.expectEqualStrings(
+        "$ printf local\nlocal",
+        transcriptBlockContent(&local_state.transcript, 0),
+    );
+
+    var shared_state = State.init();
+    try dispatchSubmission(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &shared_state,
+        "!!printf shared",
+    );
+    var command = fixture.session.inbox().tryPop(std.testing.io) orelse
+        return error.TestUnexpectedResult;
+    defer command.deinit(std.testing.allocator);
+    try std.testing.expect(command == .prompt);
+    try std.testing.expectEqualStrings("$ printf shared\nshared", command.prompt.text);
+    try std.testing.expectEqualStrings(
+        command.prompt.text,
+        transcriptBlockContent(&shared_state.transcript, 0),
+    );
+}
+
+test "autocomplete popup overlays the transcript directly above the composer" {
+    const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
+    defer fixture.deinit();
+    var state = State.init();
+    var now_ms: i64 = 0;
+    const clock: Clock = .{ .fixed_ms = &now_ms };
+
+    appendNotice(&state, "line1\nline2\nline3\nline4\nline5");
+    for ("/mo") |byte| {
+        try handleKey(
+            std.testing.allocator,
+            std.testing.io,
+            &fixture.session,
+            &state,
+            clock,
+            keyCharacter(byte),
+        );
+    }
+    var grid = try tuizr.CellGrid.init(std.testing.allocator, 40, 7);
+    defer grid.deinit();
+
+    draw(&state, &grid, "model", .low, 0);
+    const projection = try gridProjectionAlloc(std.testing.allocator, &grid);
+    defer std.testing.allocator.free(projection);
+    try std.testing.expectEqualStrings(
+        "line1\n" ++
+            "line2\n" ++
+            "line3\n" ++
+            "line4\n" ++
+            "/model  Change the active model\n" ++
+            "/mo\n" ++
+            "ready                        model • low\n",
+        projection,
+    );
 }
