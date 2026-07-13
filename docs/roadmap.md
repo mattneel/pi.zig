@@ -19,14 +19,19 @@ provider construction, and print/JSON modes as pure `AgentEvent` consumers
 with byte-exact goldens. Every subsystem multi-reviewed against upstream and
 adversarially audited; 516/517 tests (1 gated live), green across seeds.
 **Frontend switched ZigZag → tuizr (the maintainer's own TUI library, ledger
-L68). Phase 3a COMPLETE** — the interactive TUI scaffold on tuizr: the drive
-loop owns the tuizr `Terminal`, drains the `AgentEvent` outbox into a
-`StreamingView` transcript + `TextInput` composer, renders the `CellGrid`, and
-implements Pi's faithful Ctrl+C ladder (single clears the composer, double
-within 500 ms quits; Escape cancels); byte-exact `CellGrid`-projection golden;
-519 tests, green across seeds. **Next: Phase 3b — the block-structured
-transcript widget + cached streaming markdown, built INTO tuizr as reusable
-widgets (widget-ownership principle: generic UI → tuizr, agent glue → pi.zig).**
+L68). Phases 3a + 3b COMPLETE** — the interactive TUI works end-to-end on a
+real terminal: the drive loop owns the tuizr `Terminal`, drains the
+`AgentEvent` outbox, and renders a block-structured transcript (user / assistant
+/ dimmed thinking / tool / error blocks, one separator each) with markdown-
+rendered replies, over a `TextInput` composer with Pi's faithful Ctrl+C ladder.
+Both the transcript and markdown are reusable tuizr widgets (widget-ownership
+principle: generic UI → tuizr, agent glue → pi.zig); shaking out the real
+terminal surfaced and fixed several tuizr core bugs (raw-mode + size ownership,
+non-blocking input, Ctrl+C encoding, and additive-SGR / tile-boundary / wide-
+glyph encoder corruption). **Next: Phase 3c — status line (model • thinking •
+cost), working spinner, scroll-back keys, and composer depth (kill-ring,
+history, paste-collapse, sigils, autocomplete), extending tuizr's editor +
+input parser.**
 
 Phased implementation plan. Ordering is forced by the upstream dependency
 spine (hashline → catalog → agent core → tools → session → modes → TUI →
