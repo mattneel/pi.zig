@@ -8,7 +8,7 @@ final authority.
 
 Target: **oh-my-pi 16.4.7** (`inspiration/` pinned at `bb35e791`), the
 `omp` coding agent. Dependencies (all commit-pinned in `build.zig.zon`):
-ai.zig 0.1.0 (`128433a`), ZigZag 0.1.2 (`226dd3f`),
+ai.zig 0.1.0 (`128433a`), **tuizr** (local-path, the maintainer's own TUI lib),
 zig-quickjs-ng (`25836c5`, quickjs-ng 0.15.1).
 
 ---
@@ -26,7 +26,7 @@ discovery) → `agent` (13.4k, the loop) → `coding-agent` in layers
 (tools → session → modes → extensibility).
 
 **Replaced by a Zig dependency**: `ai` (88k) → **ai.zig** (§4);
-`tui` (25.5k) → **ZigZag** + custom components (§10); the eval JS worker
+`tui` (25.5k) → **tuizr** (own lib) + widgets built into it (§10); the eval JS worker
 and TS extension host → **zig-quickjs-ng** (§11).
 
 **Functionality-not-code** (Rust crates): walker/glob/grep, ANSI-aware
@@ -44,7 +44,7 @@ future conformance corpus).
 
 ```
 ┌────────────────────────────────────────────────┐
-│ frontends: tui (ZigZag) · print · json · rpc†  │
+│ frontends: tui (tuizr) · print · json · rpc†   │
 ├──────────────── AgentCommand / AgentEvent ─────┤
 │ core: AgentSession · loop · queues · approvals │
 │ session: entries · JSONL store · manager       │
@@ -289,63 +289,71 @@ deferred, ledger L6). Port verbatim from
   L4); the a/b/c rotation seam is "re-issue the step with a fresh key on
   auth failure", implementable above ai.zig later.
 
-## 10. TUI on ZigZag
+## 10. TUI on tuizr
 
-Verified base (`research/zigzag-verify.md`): Program/Terminal/unicode/input
-layers are sound; the component layer is a parts bin. Design:
+Frontend framework: **tuizr** (`~/src/tuizr`, the maintainer's own
+high-performance TUI library, wired as a local-path dependency for
+co-development; ZigZag was evaluated and dropped — see `research/zigzag-verify.md`,
+now historical). tuizr is renderer-first and immediate-mode: the app owns the
+event loop, writes cells into a triple-buffered `CellGrid` back buffer, and
+calls `render()` (tile-based SIMD diff + comptime escape encoder + synchronized
+output). It never owns an event loop or a retained widget tree.
 
-- **Manual loop**: `program.start()`, then per iteration drain the event
-  mailbox → `program.send(.{ .agent = event })` (UI thread only — `send`
-  is synchronous dispatch, confirmed), then `program.tick()`. No
-  `AsyncRunner` (unsynchronized message list — a data race as written).
-  60 fps pacing bounds mailbox latency at ~16 ms; a `Program.post`/wake
-  upstream contribution removes even that (insertion points documented in
-  zigzag-verify §13).
-- **Cancel/quit keys (no fork; ledger L68)**: ZigZag's `processKeyEvent`
-  (`core/program.zig`) intercepts only Ctrl+C (→ `running = false`, quit)
-  and Ctrl+Z (→ suspend, gated by `suspend_enabled`); every other key,
-  including Escape, is dispatched to the app model. So **Escape cancels the
-  running turn** (delivered as `AgentCommand.cancel`; this is also step 8 of
-  Pi's Esc ladder and matches Claude Code / Codex), needing no framework
-  change. **Ctrl+C keeps ZigZag's default quit**: `run()` returns to our code,
-  where the post-loop shutdown cancels the active run future, `flushSync`es
-  the session, restores the terminal, and prints the resume hint — so a
-  stray Ctrl+C loses nothing and re-entry is one `--continue`/`--resume`
-  away. Deferred (optional later refinement): a `ctrl_c: enum { quit,
-  forward }` option upstreamed to ZigZag to recover Pi's guarded Ctrl+C
-  (single clears editor, double-press-500 ms exits). Not a Phase 3
-  prerequisite.
-- **TranscriptView (custom)**: unit = rendered block
-  (`user|assistant|reasoning|tool|bash_execution|compaction|error`), each
-  caching rendered rows, height, width, theme revision,
-  collapsed/expanded, streaming flag. Blocks are **immutable once
-  finalized**; exactly one blank separator row between blocks; expansion
-  toggles invalidate and force full repaint. v1 presents an internal
-  virtualized scroll (ledger L2 — upstream commits history to native
-  terminal scrollback with no internal scrolling; the block contract keeps
-  a future append-only presenter possible). ZigZag `VirtualList` is
-  index/one-row-based — not used.
-- **Markdown**: custom cached streaming renderer (ZigZag's re-walks the
-  full source per frame and supports too small a subset). Re-render only
-  the active block; coalesce deltas to ~30 fps; final render on finish.
-  Target the upstream subset (`research/tui-spec.md` §2.3) minus LaTeX/
-  mermaid/OSC-66 (ledger L10).
-- **Editor**: ZigZag `TextArea` lacks undo/kill-ring/paste handling —
-  custom composer: multiline, history, kill ring, undo, bracketed-paste
-  collapse (>10 lines/1000 chars → `[Paste #N, +K lines]`), sigils
-  (`!`/`!!`, `$`/`$$` later, `/`, `->`/`=>` queue shorthand, `.`/`c`
-  continue), slash/file autocomplete.
-- **Key ladders**: Esc ladder and Enter-while-streaming semantics ported
-  exactly from `research/coding-agent-core.md` §6.4–6.6 (Enter = steer;
-  empty Enter with queued messages = abort + drain; ctrl+q/ctrl+enter =
-  follow-up; alt+up = LIFO dequeue).
-- **Memory**: ZigZag `ctx.allocator` is frame-arena (reset per tick) —
-  view output only. Persistent TUI allocator for blocks/caches/editor.
-  Copy at the mailbox boundary; never hold ai.zig slices.
-- Status/footer: model • thinking level, `↑in ↓out R W $cost ctx%`,
-  cwd/git branch. Golden tests: (TuiModel + dims + AgentEvents + keys) →
-  normalized frame + emitted AgentCommands, via ZigZag custom I/O files +
-  snapshot normalization.
+**Widget-ownership principle (load-bearing):** build everything generic into
+tuizr as reusable widgets (immediate-mode, draw-into-`CellGrid`, tested in
+tuizr); pi.zig keeps ONLY agent-specific glue. tuizr owns *how* to render/
+scroll/edit (`StreamingView`, `TextInput`, `TextView`, `CodeView`, `ListView`,
+`SplitPane`, and the richer transcript/editor/markdown/status widgets to come);
+pi.zig owns *what content means* (the drive loop, `AgentEvent`→widget-state and
+`KeyEvent`→`AgentCommand` mapping, Pi's keybinding/Ctrl+C-ladder/sigil
+semantics, session/resume). Design:
+
+- **Drive loop** (`src/tui/tui.zig`, pi.zig glue): launch the agent under
+  `io.async`; construct `tuizr.Terminal`; each frame drain
+  `session.outbox().tryPop` and apply events to widget state, drain
+  `terminal.pollInput()` through the key ladder, `draw()` into
+  `terminal.backBuffer()`, `render()`, then `io.sleep(16 ms)` (the yield point
+  that lets the agent task run and bounds latency to ~one frame). The outbox is
+  the thread-safe hand-off — no extra channel; tuizr's lock-free `Channel` is
+  internal to its worker→IO path. Owned events are deep-copied by the widget
+  (e.g. `StreamingView` copies bytes) then `deinit`'d immediately.
+- **Cancel/quit keys — faithful Pi ladder (ledger L68)**: tuizr forwards ALL
+  input to the app (Ctrl+C arrives as `key=.c`+ctrl; no interception), so pi.zig
+  implements Pi's guarded behavior directly. **Escape** → `AgentCommand.cancel`
+  (the Esc-ladder streaming-abort step). **Ctrl+C**: single press clears the
+  composer (sync-flush, record timestamp); double press within 500 ms quits;
+  release events filtered. **Ctrl+D** → shutdown. **Ctrl+Z** → suspend (later).
+  Quit drains shutdown, awaits the agent, `flushSync`es the session, restores
+  the terminal, prints the resume hint.
+- **Transcript**: 3a uses tuizr `StreamingView` (flat follow-bottom text —
+  auto-scroll until the user scrolls up). 3b builds the block-structured
+  transcript as a tuizr widget (a `StreamingView` v2): typed blocks
+  (`user|assistant|reasoning|tool|bash_execution|compaction|error`), per-block
+  row/height caches, **immutable once finalized**, exactly one blank separator
+  row between blocks, expansion forces full repaint, internal virtualized scroll
+  (ledger L2 — upstream commits to native scrollback; the block contract keeps a
+  future append-only presenter possible).
+- **Markdown**: a cached streaming-markdown tuizr widget (3b) — re-render only
+  the active block, coalesce deltas ~30 fps, byte-stable already-emitted rows;
+  the upstream subset (`research/tui-spec.md` §2.3) minus LaTeX/mermaid/OSC-66
+  (ledger L10).
+- **Editor**: 3a uses tuizr `TextInput` (cursor, history). 3c extends it into a
+  richer tuizr editor widget: multiline, kill ring, undo, bracketed-paste
+  collapse (>10 lines/1000 chars → `[Paste #N, +K lines]`), sigils (`!`/`!!`,
+  `$`/`$$` later, `/`, `->`/`=>` queue shorthand, `.`/`c` continue), slash/file
+  autocomplete.
+- **Key ladders (3c)**: the full Esc ladder and Enter-while-streaming semantics
+  from `research/coding-agent-core.md` §6.4–6.6 (Enter = steer; empty Enter with
+  queued messages = abort + drain; ctrl+q/ctrl+enter = follow-up; alt+up = LIFO
+  dequeue), which requires extending tuizr's input parser + `Key` enum for the
+  richer keybindings (currently practical, not exhaustive Kitty coverage).
+- **Memory**: the tuizr back buffer is the render target; pi.zig widget state
+  (`StreamingView`/`TextInput` and later block/editor state) lives on a
+  persistent allocator; copy at the mailbox boundary; never hold ai.zig slices.
+- Status/footer (3c): model • thinking level, `↑in ↓out R W $cost ctx%`,
+  cwd/git branch. Golden tests draw into a bare `CellGrid` at fixed dims and
+  assert a text projection (deterministic — no terminal), plus bridge/key unit
+  tests; generic widget-render tests live in tuizr.
 
 ## 11. QuickJS layer
 
@@ -442,7 +450,7 @@ slices:
 - One `pi` module (root `src/root.zig`) + `omp-zig` exe (`src/main.zig`);
   imports: `ai`, `provider`, `provider_utils`, `anthropic`, `openai`,
   `openai_compatible`, `openrouter`, `google`, `xai`, `mcp` (from dep
-  `ai`), `zigzag`, `quickjs` (+ `linkLibrary(artifact("quickjs-ng"))`,
+  `ai`), `tuizr` (local path), `quickjs` (+ `linkLibrary(artifact("quickjs-ng"))`,
   `use_llvm = true`).
 - `zig build test` aggregates module+exe tests; `-Dtest-filter`
   supported; `-Dlive` gates network smokes (keys from `~/src/rctr/.env`).
@@ -455,7 +463,7 @@ slices:
   corpus, selector grammar, threshold math, Esc ladder).
 - Provider-free by default: a `testkit` mock `HttpTransport` (canned
   SSE/JSON) drives ai.zig end-to-end in-process; `std.testing.io`.
-- Golden TUI tests via ZigZag custom I/O + frame normalization (the
+- Golden TUI tests via a bare `CellGrid` text projection (deterministic, no
   vendored package ships no test suite — ours lives in-tree).
 - Hashline ports the upstream test corpus first (it is this port's
   fixJson: load-bearing and self-contained).
@@ -678,16 +686,20 @@ Track every deviation here; anything not listed is a bug.
     Runtime keys, literal or environment-named models-config keys, and the five
     first-party provider environment variables are supported; command-backed
     and OAuth keys remain deferred.
-68. Cancel is Escape, quit is Ctrl+C — no ZigZag fork. Upstream Pi routes
-    Ctrl+C to the app (single press clears the editor, double press within
-    500 ms exits) and cancels the turn via the Esc ladder. The port keeps
-    ZigZag's default Ctrl+C quit and uses Escape alone to cancel the running
-    turn (`AgentCommand.cancel`). Ctrl+C quit still exits cleanly: the post-
-    loop shutdown cancels the run future, `flushSync`es the session, restores
-    the terminal, and prints the resume hint, so no session state is lost and
-    re-entry is one `--continue`/`--resume` away. The guarded-Ctrl+C behavior
-    and its `ctrl_c: enum { quit, forward }` ZigZag option are deferred to an
-    optional later refinement, not a Phase 3 prerequisite.
+68. Frontend framework is **tuizr** (the maintainer's own library), not
+    ZigZag. ZigZag was evaluated (see `research/zigzag-verify.md`, historical)
+    and dropped: pi.zig builds its own widgets, so ZigZag's breadth was never
+    the value, and tuizr's immediate-mode cell-write+render model plus its
+    lock-free channel fit better. Scope narrows to tuizr's deliberate target —
+    Linux + modern GPU terminals (WezTerm/Kitty/Ghostty), truecolor + Kitty
+    keyboard + synchronized output, no VT100/256-color/tmux fallback (a
+    reversible tuizr project-scope policy). tuizr is a local-path dependency
+    during co-development; pi.zig is its first real consumer and drives its
+    widget set. Because tuizr forwards Ctrl+C to the app, Pi's **faithful
+    guarded Ctrl+C ladder is restored** (single press clears the editor, double
+    press within 500 ms exits; Escape cancels the turn via the Esc ladder) —
+    this supersedes the ZigZag-era "Escape cancels, Ctrl+C quits, no guarded
+    behavior" compromise, which existed only because ZigZag intercepted Ctrl+C.
 
 ## 17. Phase-0 specifics (for the first implementation task)
 

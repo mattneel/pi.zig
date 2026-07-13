@@ -1,5 +1,12 @@
 # ZigZag vendored-copy verification report
 
+> **Historical (2026-07-13).** ZigZag was evaluated as the TUI frontend and
+> then dropped in favor of **tuizr** (the maintainer's own library) — see
+> porting-guide §10 and ledger L68. This report is retained as the evaluation
+> record that informed the switch (it is why the custom-widget / immediate-mode
+> direction was chosen); it no longer describes the shipping frontend.
+
+
 **Tree verified:** `/home/autark/src/zig/pi.zig/zig-pkg/zigzag-0.1.2-YXwYS_kJEgA3GRXhR4qLp6PfG0-RKpyQq-DxJLLqlF0a` (package `zigzag` v0.1.2, fingerprint `0xdffe16194b187c61`, pinned commit 226dd3f per directory hash). All `path:line` citations below are relative to this root. Total source: 33,032 lines across 96 `.zig` files (`wc -l`).
 
 **Ship manifest note (affects several claims):** `build.zig.zon` `.paths` includes only `build.zig`, `build.zig.zon`, `src`, `README.md`, `LICENSE` (build.zig.zon:6-12). The `examples/` (44 examples) and `tests/` (23 test files) directories referenced by `build.zig:15-60` and `build.zig:92-116` are **not present** in the vendored tree (verified by `find` — only LICENSE, README.md, build.zig, build.zig.zon, src/). Consuming the module via `b.dependency(...).module("zigzag")` works (those steps are never executed by a consumer), but running `zig build` or `zig build test` *inside* the vendored directory would fail on the missing files. The external test suite is therefore not available locally; only the 118 inline `test` blocks inside `src/` are.

@@ -18,20 +18,23 @@ load + v1→v3 migrations, resume) plus the gated `-Dlive` Anthropic smoke;
 provider construction, and print/JSON modes as pure `AgentEvent` consumers
 with byte-exact goldens. Every subsystem multi-reviewed against upstream and
 adversarially audited; 516/517 tests (1 gated live), green across seeds.
-**Next: Phase 3 — ZigZag TUI core. No zigzag fork required: Escape cancels
-the running turn (reaches the app natively, matching Claude Code / Codex and
-Pi's own Esc ladder), and Ctrl+C keeps ZigZag's default quit — clean because
-our post-loop shutdown still cancels the run, flushes the session, and exits
-showing the resume hint. The `ctrl_c: enum{quit,forward}` fork is deferred to
-an optional later refinement (ledger L68), not a prerequisite.**
+**Frontend switched ZigZag → tuizr (the maintainer's own TUI library, ledger
+L68). Phase 3a COMPLETE** — the interactive TUI scaffold on tuizr: the drive
+loop owns the tuizr `Terminal`, drains the `AgentEvent` outbox into a
+`StreamingView` transcript + `TextInput` composer, renders the `CellGrid`, and
+implements Pi's faithful Ctrl+C ladder (single clears the composer, double
+within 500 ms quits; Escape cancels); byte-exact `CellGrid`-projection golden;
+519 tests, green across seeds. **Next: Phase 3b — the block-structured
+transcript widget + cached streaming markdown, built INTO tuizr as reusable
+widgets (widget-ownership principle: generic UI → tuizr, agent glue → pi.zig).**
 
 Phased implementation plan. Ordering is forced by the upstream dependency
 spine (hashline → catalog → agent core → tools → session → modes → TUI →
-compaction → QuickJS) plus two project constraints: the
+compaction → QuickJS) plus one project constraint: the
 `AgentCommand`/`AgentEvent` contract must stabilize before any frontend
-lands (print/JSON prove it before the TUI consumes it). Phase 3 needs no
-ctrl_c fork (Escape cancels; ledger L68); a thread-safe `post`/wake ZigZag
-contribution stays optional (mailbox-drain-before-tick at 60 fps otherwise).
+lands (print/JSON prove it before the TUI consumes it). tuizr forwards all
+input to the app, so no framework fork is needed and Pi's guarded Ctrl+C
+ladder is implemented directly (ledger L68).
 
 Every phase lands with tests derived from the upstream behavior specs
 (exact constants/strings cited in `docs/research/`), and `zig build test`
@@ -44,7 +47,8 @@ green. Live-API smokes are opt-in (`-Dlive`, keys from `~/src/rctr/.env`).
 **Goal:** the skeleton everything else lands in.
 
 - build.zig wiring per porting-guide §14: `ai` (all needed modules),
-  `zigzag`, `quickjs` + `linkLibrary(artifact("quickjs-ng"))` +
+  `tuizr` (local-path dep; ZigZag was the original pick, since replaced),
+  `quickjs` + `linkLibrary(artifact("quickjs-ng"))` +
   `use_llvm = true`; `-Ddefault-openrouter=false` forwarded to ai.zig.
 - Directory skeleton (`src/core|session|tools|hashline|catalog|compact|
   js|modes|tui|testkit|prompts`), `root.zig` exports, `main.zig` with
@@ -118,27 +122,36 @@ mid-batch skips remaining tools with the exact skip text.
 loads in a JSONL validator against upstream's documented format; kill
 -9 mid-run loses at most the unflushed tail.
 
-## Phase 3 — ZigZag TUI core
+## Phase 3 — tuizr TUI (interactive parity for the daily loop)
 
-**Goal:** sequence step 3 — interactive parity for the daily loop.
+**Goal:** sequence step 3. Frontend is **tuizr** (porting-guide §10). The
+widget-ownership principle governs: generic UI is built INTO tuizr as reusable
+widgets; pi.zig keeps only agent glue (drive loop, `AgentEvent`↔`AgentCommand`
+mapping, Pi's key/Ctrl+C/sigil semantics).
 
-- **No ctrl_c fork prereq (ledger L68):** Escape cancels the running turn
-  (reaches the app natively; ZigZag only intercepts Ctrl+C/Ctrl+Z). Ctrl+C
-  keeps ZigZag's default quit; our post-loop shutdown cancels the run,
-  `flushSync`es the session, restores the terminal, and prints the resume
-  hint, so an accidental Ctrl+C loses nothing. A thread-safe `post`/wake
-  contribution stays optional (mailbox-drain-before-tick at 60 fps otherwise).
-- Manual start/tick loop + mailbox bridge; TranscriptView (blocks, caches,
-  finalization, one-blank-separator); cached streaming markdown; composer
-  (multiline, history, kill ring, paste collapse, sigils, autocomplete for
-  `/` and file paths); status line + footer; working loader; Esc ladder,
-  ctrl+c/d/z, Enter-while-streaming semantics — exact.
-- Golden frame tests: streaming at bottom, scrolled-up streaming, resize
-  during stream, huge tool output, cancel during tool, narrow terminal,
-  no-color.
+- **3a — scaffold (COMPLETE).** pi.zig drive loop owns the tuizr `Terminal`,
+  drains the `AgentEvent` outbox into a tuizr `StreamingView` (transcript) +
+  `TextInput` (composer), renders the `CellGrid`, paces at ~60 fps via
+  `io.sleep`. Faithful Ctrl+C ladder (single clears composer, double within
+  500 ms quits; Escape → cancel; Ctrl+D → shutdown; release events filtered),
+  approval auto-approve until Phase 5. Byte-exact `CellGrid`-projection golden +
+  bridge/key unit tests; 519 tests, green across seeds.
+- **3b — transcript + markdown (tuizr widgets).** The block-structured
+  transcript as a tuizr `StreamingView` v2: typed blocks
+  (`user|assistant|reasoning|tool|bash_execution|compaction|error`), per-block
+  caches, immutable-once-finalized, one-blank-separator, internal virtualized
+  scroll; a cached streaming-markdown widget (upstream subset minus LaTeX/
+  mermaid/OSC-66). pi.zig maps each `AgentEvent` to a block.
+- **3c — composer depth + chrome (tuizr widgets).** Extend `TextInput` into a
+  rich editor (multiline, kill ring, undo, paste collapse, sigils, slash/file
+  autocomplete); status line + footer + working loader; the full Esc ladder and
+  Enter-while-streaming semantics; extend tuizr's input parser + `Key` enum for
+  the richer keybindings.
 
-**Accept:** golden suite green; manual acceptance script (documented) for
-interrupt/steer/queue flows matches upstream behavior descriptions.
+**Accept:** widget-render tests in tuizr; pi.zig `CellGrid`-projection goldens
+(streaming at bottom, scrolled-up, huge output, narrow terminal) + bridge/key
+tests; documented manual acceptance on a real terminal for interrupt/steer/
+queue flows.
 
 ## Phase 4 — Compaction + session operations
 
