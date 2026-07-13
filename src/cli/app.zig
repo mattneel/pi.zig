@@ -328,6 +328,8 @@ fn runParsed(
         allocator,
         io,
         &session,
+        selection.model.id,
+        thinking,
         prompt_list.prompts,
         stderr,
     ) catch |err| return failError(stderr, "Interactive mode failed", err);

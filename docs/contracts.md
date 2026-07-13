@@ -121,10 +121,16 @@ prefixes and selector errors; grep `*LINE:` format; truncation notices
   loop before each frame. No additional frontend channel is used.
 - Event payloads are deep-copied at the core boundary; no ai.zig stream
   slices or session-arena pointers ever enter a mailbox.
-- The Phase 3a transcript and composer compose tuizr `StreamingView` and
-  `TextInput`; `StreamingView` copies event bytes before each owned event is
-  released. Rich transcript and editor behavior remains in tuizr's later
-  widget phases.
+- The transcript and composer compose tuizr `Transcript` and `TextInput`;
+  transcript blocks copy event bytes before each owned event is released.
+- The bottom status bar shows `ready` or an 80 ms monotonic-time spinner with
+  `working` on the left, followed by available input/output/cache token counts,
+  four-decimal total cost, and rounded context percentage. The resolved model
+  id and thinking level are right-aligned.
+- PageUp scrolls the transcript up by one viewport and Home jumps to the top.
+  End and PageDown jump to the newest content and restore follow-bottom.
+  Incremental scroll-down remains deferred until tuizr exposes a transcript
+  scroll-down operation.
 - Key release events do not trigger actions. Escape sends user cancellation;
   one Ctrl+C clears the composer and a second within 500 ms quits; Ctrl+D
   quits. Normal exit sends shutdown, awaits the agent task, synchronizes the
