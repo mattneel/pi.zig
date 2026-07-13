@@ -1,7 +1,8 @@
 //! Provider thinking-knob tables and model-aware effort mapping.
 //!
-//! Tables are transcribed from upstream `packages/ai/src/stream.ts` and
-//! `packages/catalog/src/model-thinking.ts` at the pinned revision.
+//! Tables through `max` are transcribed from upstream `packages/ai/src/stream.ts`
+//! and `packages/catalog/src/model-thinking.ts` at the pinned revision. `ultra`
+//! uses the provider-specific ceiling rules documented below.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -9,23 +10,25 @@ const types = @import("types.zig");
 pub const BudgetTable = [types.all_efforts.len]i64;
 pub const StringTable = [types.all_efforts.len][]const u8;
 
-/// `ANTHROPIC_THINKING` from `packages/ai/src/stream.ts`.
-pub const anthropic_budgets: BudgetTable = .{ 1024, 4096, 8192, 16384, 32768, 32768 };
+/// `ANTHROPIC_THINKING`; `ultra` reuses the `max` ceiling.
+pub const anthropic_budgets: BudgetTable = .{ 1024, 4096, 8192, 16384, 32768, 32768, 32768 };
 
-/// `BEDROCK_CLAUDE_THINKING`; Bedrock's low/xhigh tiers intentionally differ.
-pub const bedrock_budgets: BudgetTable = .{ 1024, 2048, 8192, 16384, 16384, 32768 };
+/// `BEDROCK_CLAUDE_THINKING`; Bedrock's low/xhigh tiers intentionally differ,
+/// and `ultra` reuses the `max` ceiling.
+pub const bedrock_budgets: BudgetTable = .{ 1024, 2048, 8192, 16384, 16384, 32768, 32768 };
 
-/// Gemini 2.5 Flash-family `getGoogleBudget` ladder.
-pub const google_25_flash_budgets: BudgetTable = .{ 128, 2048, 8192, 24576, 24576, 24576 };
+/// Gemini 2.5 Flash-family `getGoogleBudget` ladder; `ultra` reuses its ceiling.
+pub const google_25_flash_budgets: BudgetTable = .{ 128, 2048, 8192, 24576, 24576, 24576, 24576 };
 
-/// Gemini 2.5 Pro-family `getGoogleBudget` ladder.
-pub const google_25_pro_budgets: BudgetTable = .{ 128, 2048, 8192, 32768, 32768, 32768 };
+/// Gemini 2.5 Pro-family `getGoogleBudget` ladder; `ultra` reuses its ceiling.
+pub const google_25_pro_budgets: BudgetTable = .{ 128, 2048, 8192, 32768, 32768, 32768, 32768 };
 
-/// Gemini CLI fallback `GOOGLE_THINKING` ladder.
-pub const google_cli_budgets: BudgetTable = .{ 1024, 4096, 8192, 16384, 24575, 32768 };
+/// Gemini CLI fallback `GOOGLE_THINKING` ladder; `ultra` reuses its ceiling.
+pub const google_cli_budgets: BudgetTable = .{ 1024, 4096, 8192, 16384, 24575, 32768, 32768 };
 
-/// OpenAI-family identity wire strings; model `effortMap` entries override it.
-pub const openai_effort_strings: StringTable = .{ "minimal", "low", "medium", "high", "xhigh", "max" };
+/// OpenAI-family identity wire strings; `"ultra"` is the assumed API spelling,
+/// and model `effortMap` entries override it.
+pub const openai_effort_strings: StringTable = .{ "minimal", "low", "medium", "high", "xhigh", "max", "ultra" };
 
 pub const GoogleThinkingLevel = enum {
     MINIMAL,
@@ -34,11 +37,12 @@ pub const GoogleThinkingLevel = enum {
     HIGH,
 };
 
-/// `mapEffortToGoogleThinkingLevel`: xhigh/max collapse to HIGH.
+/// `mapEffortToGoogleThinkingLevel`: xhigh/max/ultra collapse to HIGH.
 pub const google_levels = [types.all_efforts.len]GoogleThinkingLevel{
     .MINIMAL,
     .LOW,
     .MEDIUM,
+    .HIGH,
     .HIGH,
     .HIGH,
     .HIGH,
@@ -126,28 +130,44 @@ pub fn mapEffort(model: *const types.Model, effort: types.Effort) MapError!Provi
     };
 }
 
-test "catalog thinking Anthropic budget table matches upstream" {
+test "catalog thinking Anthropic budget table preserves the ceiling for ultra" {
     try std.testing.expectEqual(@as(i64, 1024), anthropic_budgets[index(.minimal)]);
     try std.testing.expectEqual(@as(i64, 4096), anthropic_budgets[index(.low)]);
     try std.testing.expectEqual(@as(i64, 8192), anthropic_budgets[index(.medium)]);
     try std.testing.expectEqual(@as(i64, 16384), anthropic_budgets[index(.high)]);
     try std.testing.expectEqual(@as(i64, 32768), anthropic_budgets[index(.xhigh)]);
     try std.testing.expectEqual(@as(i64, 32768), anthropic_budgets[index(.max)]);
+    try std.testing.expectEqual(@as(i64, 32768), anthropic_budgets[index(.ultra)]);
 }
 
-test "catalog thinking Google 2.5 family ladders match upstream" {
+test "catalog thinking Google 2.5 family ladders preserve ceilings for ultra" {
     try std.testing.expectEqual(@as(i64, 128), google_25_flash_budgets[index(.minimal)]);
     try std.testing.expectEqual(@as(i64, 2048), google_25_flash_budgets[index(.low)]);
     try std.testing.expectEqual(@as(i64, 8192), google_25_flash_budgets[index(.medium)]);
     try std.testing.expectEqual(@as(i64, 24576), google_25_flash_budgets[index(.high)]);
     try std.testing.expectEqual(@as(i64, 32768), google_25_pro_budgets[index(.high)]);
     try std.testing.expectEqual(.HIGH, google_levels[index(.max)]);
+    try std.testing.expectEqual(@as(i64, 24576), google_25_flash_budgets[index(.ultra)]);
+    try std.testing.expectEqual(@as(i64, 32768), google_25_pro_budgets[index(.ultra)]);
+    try std.testing.expectEqual(@as(i64, 32768), google_cli_budgets[index(.ultra)]);
+    try std.testing.expectEqual(.HIGH, google_levels[index(.ultra)]);
 }
 
-test "catalog thinking OpenAI effort strings match upstream" {
+test "catalog thinking OpenAI effort strings include the ultra identity" {
     try std.testing.expectEqualStrings("minimal", openai_effort_strings[index(.minimal)]);
     try std.testing.expectEqualStrings("xhigh", openai_effort_strings[index(.xhigh)]);
     try std.testing.expectEqualStrings("max", openai_effort_strings[index(.max)]);
+    try std.testing.expectEqualStrings("ultra", openai_effort_strings[index(.ultra)]);
+}
+
+test "catalog thinking ultra maps to OpenAI identity and other provider ceilings" {
+    try std.testing.expectEqual(types.Effort.ultra, types.ThinkingLevel.ultra.asEffort().?);
+    try std.testing.expectEqualStrings("ultra", openai_effort_strings[index(.ultra)]);
+    try std.testing.expectEqual(anthropic_budgets[index(.max)], anthropic_budgets[index(.ultra)]);
+    try std.testing.expectEqual(bedrock_budgets[index(.max)], bedrock_budgets[index(.ultra)]);
+    try std.testing.expectEqual(google_25_flash_budgets[index(.max)], google_25_flash_budgets[index(.ultra)]);
+    try std.testing.expectEqual(google_25_pro_budgets[index(.max)], google_25_pro_budgets[index(.ultra)]);
+    try std.testing.expectEqual(google_cli_budgets[index(.max)], google_cli_budgets[index(.ultra)]);
 }
 
 test "catalog thinking mapEffort uses real bundled model modes" {

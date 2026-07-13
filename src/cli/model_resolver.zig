@@ -404,6 +404,10 @@ test "bundled model selection supports provider ids fuzzy names and thinking suf
     try std.testing.expectEqualStrings("claude-sonnet-4-6", exact.model.id);
     try std.testing.expectEqual(catalog.ThinkingLevel.medium, exact.thinking.?);
 
+    const ultra = splitThinking(&exact.registry, "anthropic/claude-sonnet-4-6:ultra");
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-6", ultra.selector);
+    try std.testing.expectEqual(catalog.ThinkingLevel.ultra, ultra.thinking.?);
+
     var fuzzy = try Selection.init(std.testing.allocator, "Claude Sonnet 4.6");
     defer fuzzy.deinit();
     try std.testing.expectEqualStrings("anthropic", fuzzy.model.provider);

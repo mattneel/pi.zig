@@ -257,6 +257,14 @@ test "CLI parser keeps bare resume and reports invalid enum values" {
     try std.testing.expectEqualStrings("rpc", bare.validation_error.?.value);
 }
 
+test "CLI parser accepts ultra thinking" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(), &.{ "--thinking", "ultra" });
+    try std.testing.expect(parsed.validation_error == null);
+    try std.testing.expectEqual(catalog.ThinkingLevel.ultra, parsed.thinking.?);
+}
+
 test "CLI parser reports a missing required flag value" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

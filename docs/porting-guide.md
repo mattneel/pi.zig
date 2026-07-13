@@ -277,10 +277,11 @@ deferred, ledger L6). Port verbatim from
   effortRouting), api, baseUrl. `calculateCost(model, usage)` ported;
   ai.zig `Usage` maps: input↔no_cache, cache_read/cache_write↔cacheRead/
   cacheWrite, output.total/reasoning↔output/reasoningTokens.
-- Thinking levels `off|minimal|low|medium|high|xhigh|max` (+`auto` later):
+- Thinking levels `off|minimal|low|medium|high|xhigh|max|ultra` (+`auto` later):
   port owns the Effort→(adaptive|budget|effort-string) mapping tables;
   drive ai.zig via `reasoning` + `provider_options` (Anthropic budgets
-  minimal 1024 → xhigh/max 32768; `max` maps per-provider, ledger L11).
+  minimal 1024 → xhigh/max/ultra 32768; top levels map per-provider,
+  ledger L11).
 - Model roles `default/smol/slow/plan/…` + fuzzy `--model` resolution +
   Ctrl+P cycle scope; per-role fallback chains feed the auto-retry layer.
 - Auth v1: explicit API keys — CLI `--api-key` → models config → env var
@@ -503,9 +504,10 @@ Track every deviation here; anything not listed is a bug.
    installed omp; format-compatible session files.
 10. **Markdown subset omits LaTeX→Unicode, mermaid, OSC 66 sized
     headings, DECCARA/SGR-coalescing optimizations** initially.
-11. **Thinking `max` maps to the provider's nearest knob** (ai.zig
-    `ReasoningEffort` tops at xhigh; Anthropic `effort: max` via
-    provider_options where supported).
+11. **Thinking `max` and `ultra` map to each provider's nearest knob**
+    (ai.zig `ReasoningEffort` tops at xhigh; the catalog assumes the OpenAI
+    family accepts `ultra`, while Anthropic, Bedrock, and Google collapse it
+    to their existing ceilings).
 12. **Extension tool parameters are JSON Schema**, not zod/TypeBox/
     arktype shims.
 13. **In-band tool-calling dialects (harmony/qwen3/kimi/…) not ported**

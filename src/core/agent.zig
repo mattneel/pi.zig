@@ -1413,7 +1413,7 @@ fn reasoningEffort(level: catalog.ThinkingLevel) ?provider.ReasoningEffort {
         .low => .low,
         .medium => .medium,
         .high => .high,
-        .xhigh, .max => .xhigh,
+        .xhigh, .max, .ultra => .xhigh,
     };
 }
 

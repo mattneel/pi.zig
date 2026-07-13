@@ -32,7 +32,7 @@ pub const help_text =
     \\Options:
     \\  --cwd <path>
     \\  --model <fuzzy|provider/id[:thinking]>
-    \\  --thinking <off|minimal|low|medium|high|xhigh|max>
+    \\  --thinking <off|minimal|low|medium|high|xhigh|max|ultra>
     \\  -p, --print
     \\  --mode <text|json>
     \\  -r, --resume [session]

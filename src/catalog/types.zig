@@ -74,9 +74,10 @@ pub const Effort = enum {
     high,
     xhigh,
     max,
+    ultra,
 };
 
-pub const all_efforts = [_]Effort{ .minimal, .low, .medium, .high, .xhigh, .max };
+pub const all_efforts = [_]Effort{ .minimal, .low, .medium, .high, .xhigh, .max, .ultra };
 
 /// Session-facing thinking level; `off` is not a provider effort.
 pub const ThinkingLevel = enum {
@@ -87,6 +88,7 @@ pub const ThinkingLevel = enum {
     high,
     xhigh,
     max,
+    ultra,
 
     pub fn asEffort(self: ThinkingLevel) ?Effort {
         return switch (self) {
@@ -97,6 +99,7 @@ pub const ThinkingLevel = enum {
             .high => .high,
             .xhigh => .xhigh,
             .max => .max,
+            .ultra => .ultra,
         };
     }
 };
@@ -116,6 +119,7 @@ pub const EffortBudgets = struct {
     high: ?i64 = null,
     xhigh: ?i64 = null,
     max: ?i64 = null,
+    ultra: ?i64 = null,
 
     pub fn get(self: EffortBudgets, effort: Effort) ?i64 {
         return switch (effort) {
@@ -132,6 +136,7 @@ pub const EffortMap = struct {
     high: ?[]const u8 = null,
     xhigh: ?[]const u8 = null,
     max: ?[]const u8 = null,
+    ultra: ?[]const u8 = null,
 
     pub fn get(self: EffortMap, effort: Effort) ?[]const u8 {
         return switch (effort) {
@@ -149,6 +154,7 @@ pub const EffortRouting = struct {
     high: ?[]const u8 = null,
     xhigh: ?[]const u8 = null,
     max: ?[]const u8 = null,
+    ultra: ?[]const u8 = null,
 
     pub fn get(self: EffortRouting, level: ThinkingLevel) ?[]const u8 {
         return switch (level) {

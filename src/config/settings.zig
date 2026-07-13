@@ -290,6 +290,23 @@ test "settings defaults match the phase two consumed schema" {
     try std.testing.expect(settings.include_model_in_prompt);
 }
 
+test "settings accepts ultra as the default thinking level" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "ultra.json", "{\"defaultThinkingLevel\":\"ultra\"}");
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var settings = try Settings.load(allocator, io, .{
+        .cwd = root,
+        .overlays = &.{"ultra.json"},
+        .path_options = .{ .agent_dir = root, .home = root, .temp_dir = "/tmp" },
+    });
+    defer settings.deinit();
+    try std.testing.expectEqual(catalog.ThinkingLevel.ultra, settings.default_thinking_level);
+}
+
 test "settings precedence deep merges objects and replaces scalars and arrays" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
