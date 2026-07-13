@@ -34,6 +34,7 @@ const State = struct {
     assistant_id: [128]u8 = undefined,
     assistant_id_len: usize = 0,
     assistant_has_delta: bool = false,
+    stream_line: enum { none, assistant, reasoning } = .none,
 
     fn init(width: u16, height: u16) State {
         return .{
@@ -71,6 +72,7 @@ const State = struct {
         self.append(prefix);
         self.append(text);
         self.append("\n");
+        self.stream_line = .none;
     }
 
     fn appendPrompt(self: *State, text: []const u8) void {
@@ -79,10 +81,10 @@ const State = struct {
 
     fn startAssistant(self: *State, id: []const u8) void {
         self.ensureLineStart();
-        self.append("assistant: ");
         self.assistant_id_len = @min(id.len, self.assistant_id.len);
         @memcpy(self.assistant_id[0..self.assistant_id_len], id[0..self.assistant_id_len]);
         self.assistant_has_delta = false;
+        self.stream_line = .none;
     }
 
     fn assistantMatches(self: *const State, id: []const u8) bool {
@@ -90,9 +92,34 @@ const State = struct {
             std.mem.eql(u8, self.assistant_id[0..self.assistant_id_len], id);
     }
 
+    fn startAssistantLine(self: *State) void {
+        if (self.stream_line == .assistant) return;
+        self.ensureLineStart();
+        self.append("assistant: ");
+        self.stream_line = .assistant;
+    }
+
+    fn appendAssistantDelta(self: *State, delta: events.TextDelta) void {
+        if (self.assistantMatches(delta.message_id)) {
+            self.startAssistantLine();
+            self.assistant_has_delta = true;
+        }
+        self.append(delta.text);
+    }
+
+    fn appendReasoningDelta(self: *State, delta: events.ReasoningDelta) void {
+        if (self.stream_line != .reasoning) {
+            self.ensureLineStart();
+            self.append("thinking: ");
+            self.stream_line = .reasoning;
+        }
+        self.append(delta.text);
+    }
+
     fn finishAssistant(self: *State, finished: events.MessageFinished) void {
         if (!self.assistantMatches(finished.id)) return;
         if (!self.assistant_has_delta) {
+            self.startAssistantLine();
             for (finished.text_blocks, 0..) |block, index| {
                 if (index != 0) self.append("\n");
                 self.append(block);
@@ -101,9 +128,10 @@ const State = struct {
                 if (finished.error_message) |message| self.append(message);
             }
         }
-        self.append("\n");
+        self.ensureLineStart();
         self.assistant_id_len = 0;
         self.assistant_has_delta = false;
+        self.stream_line = .none;
     }
 };
 
@@ -202,16 +230,17 @@ fn applyEvent(state: *State, event: events.AgentEvent) void {
         .message_started => |started| if (started.role == .assistant) {
             state.startAssistant(started.id);
         },
-        .text_delta => |delta| {
-            state.append(delta.text);
-            if (state.assistantMatches(delta.message_id)) state.assistant_has_delta = true;
-        },
+        .text_delta => |delta| state.appendAssistantDelta(delta),
+        .reasoning_delta => |delta| state.appendReasoningDelta(delta),
         .message_finished => |finished| state.finishAssistant(finished),
+        .tool_started => |started| state.appendLine("→ ", started.tool_name),
+        .tool_finished => |finished| state.appendLine("  ", if (finished.is_error) "error" else "done"),
         .approval_requested => |request| {
             state.ensureLineStart();
             state.append("auto-approved ");
             state.append(request.tool_name);
             state.append(" (approval UI arrives in Phase 5)\n");
+            state.stream_line = .none;
         },
         .notice => |notice| state.appendLine("notice: ", notice.message),
         .failed => |failure| state.appendLine("error: ", failure.message),
@@ -229,7 +258,7 @@ fn handleKey(
 ) !void {
     if (key_event.event_type == .release) return;
 
-    if (key_event.key == .c and key_event.modifiers.ctrl) {
+    if ((key_event.key == .c and key_event.modifiers.ctrl) or key_event.codepoint == 3) {
         const now_ms = clock.nowMs();
         if (state.last_ctrl_c_ms) |previous| {
             if (now_ms >= previous and now_ms - previous <= double_ctrl_c_ms) {
@@ -370,6 +399,26 @@ fn applyAssistantScript(allocator: Allocator, state: *State) !void {
     for (script) |event| applyEvent(state, event);
 }
 
+fn applyActivityScript(allocator: Allocator, state: *State) !void {
+    var script = [_]events.AgentEvent{
+        .run_started,
+        .{ .message_started = try events.MessageStarted.init(allocator, "a1", .assistant) },
+        .{ .reasoning_delta = try events.ReasoningDelta.init(allocator, "a1", "pondering") },
+        .{ .tool_started = try events.ToolStarted.init(allocator, "t1", "read", "{}") },
+        .{ .tool_finished = try events.ToolFinished.init(allocator, "t1", "read", false, null) },
+        .{ .text_delta = try events.TextDelta.init(allocator, "a1", "Hi") },
+        .{ .message_finished = try events.MessageFinished.init(
+            allocator,
+            "a1",
+            .stop,
+            &.{"Hi"},
+            null,
+        ) },
+    };
+    defer for (&script) |*event| event.deinit(allocator);
+    for (script) |event| applyEvent(state, event);
+}
+
 fn gridProjectionAlloc(allocator: Allocator, grid: *const tuizr.CellGrid) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
@@ -470,6 +519,25 @@ test "composed frame matches the CellGrid text projection" {
     );
 }
 
+test "reasoning and tool activity precede the streamed reply in the CellGrid projection" {
+    var state = State.init(64, 6);
+    try applyActivityScript(std.testing.allocator, &state);
+    var grid = try tuizr.CellGrid.init(std.testing.allocator, 64, 8);
+    defer grid.deinit();
+
+    draw(&state, &grid);
+    const projection = try gridProjectionAlloc(std.testing.allocator, &grid);
+    defer std.testing.allocator.free(projection);
+    try std.testing.expectEqualStrings(
+        "thinking: pondering\n" ++
+            "→ read\n" ++
+            "  done\n" ++
+            "assistant: Hi\n\n\n\n" ++
+            "running | esc cancel | ctrl+c clear/quit | ctrl+d quit\n",
+        projection,
+    );
+}
+
 test "text input submission pushes one prompt and clears the composer" {
     const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
     defer fixture.deinit();
@@ -534,6 +602,24 @@ test "Ctrl+C clears once and quits only on a second press within 500ms" {
     try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &late_state, clock, keyCtrlC(.press));
     try std.testing.expect(!late_state.quit_requested);
     try std.testing.expectEqual(@as(usize, 0), late_state.composer.len);
+}
+
+test "raw Ctrl+C clears once and quits only on a second press within 500ms" {
+    const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
+    defer fixture.deinit();
+    var now_ms: i64 = 1_000;
+    const clock: Clock = .{ .fixed_ms = &now_ms };
+    var state = State.init(40, 4);
+    const raw_ctrl_c = tuizr.KeyEvent{ .key = .character, .codepoint = 3 };
+
+    try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &state, clock, keyCharacter('x'));
+    try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &state, clock, raw_ctrl_c);
+    try std.testing.expectEqual(@as(usize, 0), state.composer.len);
+    try std.testing.expect(!state.quit_requested);
+
+    now_ms = 1_499;
+    try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &state, clock, raw_ctrl_c);
+    try std.testing.expect(state.quit_requested);
 }
 
 test "Ctrl+D codepoint requests a normal quit" {
