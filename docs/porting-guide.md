@@ -374,14 +374,17 @@ timers, fetch, TextEncoder, or disk module loader — host work. Design:
   **json** (`--mode json`: header line then one `AgentEvent` JSON per
   line). RPC (NDJSON, `docs/rpc.md`) is phase 8; ACP deferred.
 - Flag surface ported from `research/coding-agent-core.md` §1.3 in slices
-  per phase (phase 2 minimum: `--cwd --model --thinking -p --mode
-  --resume/-r --continue/-c --no-session --session-dir --api-key --tools
-  --system-prompt --append-system-prompt --no-tools`). Exit codes: 0
-  success/user-cancel, 1 error, 2 unknown flags, 130 double-SIGINT.
-- Settings: global `config.yml` → project `.omp-zig/config.yml` → CLI
-  overlays → runtime; defaults table from coding-agent-core §5.2 (approval
-  mode default `yolo`, `edit.mode hashline`, `read.defaultLimit 300`,
-  compaction reserve 16384 / keepRecent 20000, …).
+  per phase. Phase 2 accepts `--cwd`, `--model`, `--thinking`,
+  `-p`/`--print`, `--mode`, `--resume`/`-r`, `--continue`/`-c`,
+  `--no-session`, `--session-dir`, repeated `--config`, `--api-key`,
+  `--tools`, `--no-tools`, `--system-prompt`, `--append-system-prompt`,
+  `--version`/`-v`, and `--help`/`-h`. Exit codes: 0 success/user-cancel,
+  1 error, 2 unknown flags, 130 double-SIGINT.
+- Settings: global `~/.omp-zig/agent/config.json` → cwd-only project
+  `.omp-zig/config.json` → repeated JSON CLI overlays → runtime; defaults
+  table from coding-agent-core §5.2 (approval mode default `yolo`,
+  `edit.mode hashline`, `read.defaultLimit 300`, retry defaults, model roles,
+  and cycle order). The JSON format is ledgered in L61.
 
 ## 13. Tools
 
@@ -473,8 +476,12 @@ Track every deviation here; anything not listed is a bug.
 7. **eval v1 = JS only, no npm resolution, no TypeScript cells**; Bun
    globals replaced by host bindings; Python kernel (subprocess NDJSON)
    ports later unchanged in architecture.
-8. **No SQLite in v1**: prompt history as JSONL; github cache, auth store,
-   models cache deferred with their features.
+8. **No SQLite in v1**: prompt history is consecutive-deduplicated JSONL at
+   `~/.omp-zig/agent/history.jsonl`; github cache, auth store, models cache,
+   history search metadata, and FTS are deferred with their features. The CLI
+   treats history as best-effort. Dedupe reads only the final record, and each
+   process holds an exclusive advisory file lock across the dedupe check and
+   one complete-record append.
 9. **Own config/session root** (`~/.omp-zig/`) — no cohabitation with an
    installed omp; format-compatible session files.
 10. **Markdown subset omits LaTeX→Unicode, mermaid, OSC 66 sized
@@ -636,6 +643,32 @@ Track every deviation here; anything not listed is a bug.
     500,000 UTF-16-unit boundary. Upstream slices JavaScript UTF-16 code units
     and can split a surrogate pair at that boundary; Zig keeps the persisted
     string valid UTF-8, following the string-boundary adaptation in ledger L16.
+61. Phase 2b settings files use JSON (`~/.omp-zig/agent/config.json`,
+    `<cwd>/.omp-zig/config.json`, and JSON `--config` overlays) instead of
+    upstream YAML. Zig's standard library has no YAML parser, no dependency is
+    added, and the separate `.omp-zig` root means no config-file interoperation
+    is claimed. Provider keys likewise use the root's `models.json` during this
+    phase. Precedence and deep-merge behavior match upstream.
+62. The Phase 2b settings schema validates and exposes the keys consumed by the
+    CLI, model setup, retry policy, approval policy, and essential tools. Other
+    settings remain preserved in the merged JSON object but gain typed runtime
+    behavior incrementally as their owning phases land.
+63. A TTY launch without `-p` or `--mode` exits successfully with the Phase 3
+    interactive-mode notice. RPC and ACP frontends remain deferred to Phase 8;
+    `--mode` accepts only `text` and `json` in this slice.
+64. Phase 2b does not expand `@file` prompt arguments. It returns a clear
+    non-interactive error instead; file text/image attachment lands with the
+    media-aware prompt pipeline.
+65. Launch flags outside the explicit Phase 2b set are not accepted as inert
+    compatibility flags. They remain deferred with their owning features and
+    are reported through the unknown-flag path with exit code 2.
+66. Non-interactive resume does not offer upstream's move/fork dialogue for a
+    session recorded in another project. It reports that resume was cancelled
+    and exits 0; the dialogue belongs to the Phase 3 frontend.
+67. Models-config `apiKey: "!command"` execution is not supported in Phase 2b.
+    Runtime keys, literal or environment-named models-config keys, and the five
+    first-party provider environment variables are supported; command-backed
+    and OAuth keys remain deferred.
 
 ## 17. Phase-0 specifics (for the first implementation task)
 

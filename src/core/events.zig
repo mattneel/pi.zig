@@ -322,24 +322,59 @@ pub const ReasoningDelta = TextDelta;
 pub const MessageFinished = struct {
     id: []u8,
     stop_reason: ?message.StopReason = null,
+    text_blocks: [][]u8,
+    error_message: ?[]u8 = null,
 
     pub fn init(
         allocator: Allocator,
         id: []const u8,
         stop_reason: ?message.StopReason,
+        text_blocks: []const []const u8,
+        error_message: ?[]const u8,
     ) !MessageFinished {
+        const owned_id = try allocator.dupe(u8, id);
+        errdefer allocator.free(owned_id);
+        const owned_blocks = try allocator.alloc([]u8, text_blocks.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned_blocks[0..initialized]) |block| allocator.free(block);
+            allocator.free(owned_blocks);
+        }
+        for (text_blocks, owned_blocks) |block, *destination| {
+            destination.* = try allocator.dupe(u8, block);
+            initialized += 1;
+        }
         return .{
-            .id = try allocator.dupe(u8, id),
+            .id = owned_id,
             .stop_reason = stop_reason,
+            .text_blocks = owned_blocks,
+            .error_message = try dupeOptional(allocator, error_message),
         };
     }
 
+    pub fn initAssistant(
+        allocator: Allocator,
+        id: []const u8,
+        assistant: message.AssistantMessage,
+    ) !MessageFinished {
+        var texts: std.ArrayList([]const u8) = .empty;
+        defer texts.deinit(allocator);
+        for (assistant.content) |block| switch (block) {
+            .text => |text| try texts.append(allocator, text.text),
+            else => {},
+        };
+        return init(allocator, id, assistant.stop_reason, texts.items, assistant.error_message);
+    }
+
     pub fn dupeInto(self: MessageFinished, allocator: Allocator) !MessageFinished {
-        return init(allocator, self.id, self.stop_reason);
+        return init(allocator, self.id, self.stop_reason, self.text_blocks, self.error_message);
     }
 
     pub fn deinit(self: *MessageFinished, allocator: Allocator) void {
         allocator.free(self.id);
+        for (self.text_blocks) |block| allocator.free(block);
+        allocator.free(self.text_blocks);
+        freeOptional(allocator, self.error_message);
         self.* = undefined;
     }
 };
@@ -665,6 +700,92 @@ pub const AgentEvent = union(enum) {
     notice: Notice,
     failed: OwnedError,
 
+    /// Stable JSON-mode representation: one flat object with the active event
+    /// name in `type`, followed by the payload fields in declaration order.
+    pub fn jsonStringify(self: AgentEvent, jw: anytype) !void {
+        try jw.beginObject();
+        try eventField(jw, "type", @tagName(self));
+        switch (self) {
+            .run_started, .turn_started => {},
+            .run_finished => |value| {
+                try eventField(jw, "status", value.status);
+                try eventField(jw, "turns", value.turns);
+            },
+            .turn_finished => |value| {
+                if (value.stop_reason) |reason| try eventField(jw, "stop_reason", reason);
+                try eventField(jw, "tool_calls", value.tool_calls);
+                try eventField(jw, "tool_results", value.tool_results);
+            },
+            .message_started => |value| {
+                try eventField(jw, "id", value.id);
+                try eventField(jw, "role", value.role);
+            },
+            .text_delta, .reasoning_delta => |value| {
+                try eventField(jw, "message_id", value.message_id);
+                try eventField(jw, "text", value.text);
+            },
+            .message_finished => |value| {
+                try eventField(jw, "id", value.id);
+                if (value.stop_reason) |reason| try eventField(jw, "stop_reason", reason);
+                if (value.text_blocks.len != 0) try eventField(jw, "text_blocks", value.text_blocks);
+                if (value.error_message) |error_message| try eventField(jw, "error_message", error_message);
+            },
+            .tool_started => |value| {
+                try eventField(jw, "tool_call_id", value.tool_call_id);
+                try eventField(jw, "tool_name", value.tool_name);
+                try eventField(jw, "input_json", value.input_json);
+            },
+            .tool_output => |value| {
+                try eventField(jw, "tool_call_id", value.tool_call_id);
+                try eventField(jw, "bytes", value.bytes);
+            },
+            .tool_finished => |value| {
+                try eventField(jw, "tool_call_id", value.tool_call_id);
+                try eventField(jw, "tool_name", value.tool_name);
+                try eventField(jw, "is_error", value.is_error);
+                if (value.output_json) |output| try eventField(jw, "output_json", output);
+            },
+            .approval_requested => |value| {
+                try eventField(jw, "request_id", value.request_id);
+                try eventField(jw, "tool_call_id", value.tool_call_id);
+                try eventField(jw, "tool_name", value.tool_name);
+                if (value.reason) |reason| try eventField(jw, "reason", reason);
+                if (value.details_json) |details| try eventField(jw, "details_json", details);
+            },
+            .auto_compaction_started => |value| try eventField(jw, "reason", value),
+            .auto_compaction_finished => |value| {
+                try eventField(jw, "summary", value.summary);
+                if (value.short_summary) |summary| try eventField(jw, "short_summary", summary);
+                try eventField(jw, "tokens_before", value.tokens_before);
+            },
+            .auto_retry_started => |value| {
+                try eventField(jw, "attempt", value.attempt);
+                try eventField(jw, "max_attempts", value.max_attempts);
+                try eventField(jw, "delay_ms", value.delay_ms);
+                try eventField(jw, "error_message", value.error_message);
+            },
+            .auto_retry_finished => |value| {
+                try eventField(jw, "success", value.success);
+                try eventField(jw, "attempt", value.attempt);
+                if (value.final_error) |failure| try eventField(jw, "final_error", failure);
+            },
+            .usage_updated => |value| {
+                try eventField(jw, "usage", value.usage);
+                if (value.context_window) |window| try eventField(jw, "context_window", window);
+                if (value.context_percent) |percent| try eventField(jw, "context_percent", percent);
+            },
+            .notice => |value| {
+                try eventField(jw, "level", value.level);
+                try eventField(jw, "message", value.message);
+            },
+            .failed => |value| {
+                if (value.code) |code| try eventField(jw, "code", code);
+                try eventField(jw, "message", value.message);
+            },
+        }
+        try jw.endObject();
+    }
+
     pub fn dupeInto(self: AgentEvent, allocator: Allocator) !AgentEvent {
         return switch (self) {
             .message_started => |value| .{ .message_started = try value.dupeInto(allocator) },
@@ -709,6 +830,15 @@ pub const AgentEvent = union(enum) {
         self.* = undefined;
     }
 };
+
+fn eventField(jw: anytype, name: []const u8, value: anytype) !void {
+    try jw.objectField(name);
+    try jw.write(value);
+}
+
+pub fn stringifyEventAlloc(allocator: Allocator, event: AgentEvent) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, event, .{ .emit_null_optional_fields = false });
+}
 
 test "events AgentCommand dupeInto deeply owns prompt payloads" {
     const allocator = std.testing.allocator;

@@ -21,6 +21,7 @@ pub const CreateOptions = struct {
 };
 
 pub const OpenOptions = struct {
+    session_dir: ?[]const u8 = null,
     path_options: paths.Options = .{},
 };
 
@@ -185,6 +186,13 @@ pub const SessionManager = struct {
         return self.session_path;
     }
 
+    pub fn getHeader(self: *const SessionManager) entry_wire.SessionHeader {
+        var header = self.header;
+        header.title = self.title;
+        header.titleSource = self.title_source;
+        return header;
+    }
+
     pub fn continueRecent(
         gpa: Allocator,
         io: std.Io,
@@ -196,7 +204,10 @@ pub const SessionManager = struct {
         for (found) |info| {
             if (info.resumable) return open(gpa, io, info.path, options);
         }
-        return create(gpa, io, cwd, .{ .path_options = options.path_options });
+        return create(gpa, io, cwd, .{
+            .session_dir = options.session_dir,
+            .path_options = options.path_options,
+        });
     }
 
     pub fn list(
@@ -205,7 +216,10 @@ pub const SessionManager = struct {
         cwd: []const u8,
         options: OpenOptions,
     ) ![]SessionInfo {
-        const directory = try paths.defaultSessionDirAlloc(gpa, io, cwd, options.path_options);
+        const directory = if (options.session_dir) |value|
+            try std.fs.path.resolve(gpa, &.{value})
+        else
+            try paths.defaultSessionDirAlloc(gpa, io, cwd, options.path_options);
         defer gpa.free(directory);
         return listDirectory(gpa, io, directory, false);
     }

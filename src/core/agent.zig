@@ -94,6 +94,8 @@ pub const Options = struct {
     retry: RetryOptions = .{},
     /// When absent, the agent owns an in-memory session manager.
     session_manager: ?*session_manager.SessionManager = null,
+    restore_model_from_session: bool = true,
+    restore_thinking_from_session: bool = true,
     max_output_tokens: ?f64 = null,
 };
 
@@ -182,6 +184,8 @@ pub const AgentSession = struct {
     retry: RetryOptions,
     session_manager: *session_manager.SessionManager,
     owns_session_manager: bool,
+    restore_model_from_session: bool,
+    restore_thinking_from_session: bool,
     max_output_tokens: ?f64,
 
     state_mutex: std.Io.Mutex = .init,
@@ -282,6 +286,8 @@ pub const AgentSession = struct {
             .retry = options.retry,
             .session_manager = persistence,
             .owns_session_manager = options.session_manager == null,
+            .restore_model_from_session = options.restore_model_from_session,
+            .restore_thinking_from_session = options.restore_thinking_from_session,
             .max_output_tokens = options.max_output_tokens,
         };
         try result.restoreFromSession();
@@ -394,14 +400,7 @@ pub const AgentSession = struct {
             var command = owned_command;
             defer command.deinit(self.gpa);
             switch (command) {
-                .prompt => |prompt| {
-                    if (self.running.load(.acquire)) {
-                        try self.emitNotice(.warning, "Agent is already running");
-                    } else {
-                        try self.enqueuePrompt(&self.initial_queue, prompt);
-                        self.startRun();
-                    }
-                },
+                .prompt => |prompt| try self.handlePrompt(prompt),
                 .steer => |prompt| {
                     try self.enqueuePrompt(&self.steering_queue, prompt);
                     if (!self.running.load(.acquire)) self.startRun();
@@ -436,6 +435,11 @@ pub const AgentSession = struct {
         self.event_outbox.close(self.io);
     }
 
+    fn handlePrompt(self: *AgentSession, prompt: events.OwnedPrompt) !void {
+        try self.enqueuePrompt(&self.initial_queue, prompt);
+        if (!self.running.load(.acquire)) self.startRun();
+    }
+
     fn startRun(self: *AgentSession) void {
         if (self.running.swap(true, .acq_rel)) return;
         self.aborted.store(false, .release);
@@ -445,7 +449,13 @@ pub const AgentSession = struct {
     }
 
     fn runTask(self: *AgentSession) std.Io.Cancelable!void {
-        self.runGenerations() catch |err| self.persistFailure(@errorName(err));
+        self.runGenerations() catch |err| {
+            self.persistFailure(@errorName(err));
+            self.emit(.{ .run_finished = .{ .status = .failed, .turns = 0 } }) catch |emit_err|
+                self.recordCallbackError(emit_err);
+            self.running.store(false, .release);
+            if (!self.shutting_down.load(.acquire) and self.hasQueuedInput()) self.startRun();
+        };
     }
 
     fn runGenerations(self: *AgentSession) !void {
@@ -531,7 +541,7 @@ pub const AgentSession = struct {
         const self: *AgentSession = @ptrCast(@alignCast(raw));
         var id_buffer: [64]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buffer, "assistant-{d}-{d}", .{ self.generation.load(.acquire), self.step_number });
-        var finished = try events.MessageFinished.init(self.gpa, id, value.stop_reason);
+        var finished = try events.MessageFinished.initAssistant(self.gpa, id, value);
         defer finished.deinit(self.gpa);
         try self.emit(.{ .message_finished = finished });
         const model = self.catalogModel(value.provider, value.model);
@@ -1016,18 +1026,22 @@ pub const AgentSession = struct {
             },
             else => {},
         };
-        if (selected_thinking) |value| self.thinking = value;
-        if (selected_model) |combined| {
-            if (std.mem.indexOfScalar(u8, combined, '/')) |separator| {
-                const provider_name = combined[0..separator];
-                const model_id = combined[separator + 1 ..];
-                if (self.resolve_model) |resolver| if (resolver.resolve_fn(resolver.ctx, provider_name, model_id)) |target| {
-                    self.current_model = try cloneTarget(self.config_arena_state.allocator(), target);
-                    self.current_model_role = if (selected_role) |role|
-                        try self.config_arena_state.allocator().dupe(u8, role)
-                    else
-                        null;
-                };
+        if (self.restore_thinking_from_session) {
+            if (selected_thinking) |value| self.thinking = value;
+        }
+        if (self.restore_model_from_session) {
+            if (selected_model) |combined| {
+                if (std.mem.indexOfScalar(u8, combined, '/')) |separator| {
+                    const provider_name = combined[0..separator];
+                    const model_id = combined[separator + 1 ..];
+                    if (self.resolve_model) |resolver| if (resolver.resolve_fn(resolver.ctx, provider_name, model_id)) |target| {
+                        self.current_model = try cloneTarget(self.config_arena_state.allocator(), target);
+                        self.current_model_role = if (selected_role) |role|
+                            try self.config_arena_state.allocator().dupe(u8, role)
+                        else
+                            null;
+                    };
+                }
             }
         }
     }
@@ -1132,16 +1146,14 @@ pub const AgentSession = struct {
     fn persistFailure(self: *AgentSession, text: []const u8) void {
         const assistant = self.errorAssistant(self.currentTarget(), text) catch |err| {
             self.recordCallbackError(err);
+            self.emitFailure(text) catch |emit_err| self.recordCallbackError(emit_err);
             return;
         };
         self.messages.append(self.message_arena_state.allocator(), .{ .assistant = assistant }) catch |err| {
             self.recordCallbackError(err);
-            return;
         };
-        _ = self.session_manager.appendMessage(.{ .assistant = assistant }) catch |err| {
-            self.recordCallbackError(err);
-            return;
-        };
+        if (self.session_manager.appendMessage(.{ .assistant = assistant })) |_| {} else |err| self.recordCallbackError(err);
+        self.emitMessageLifecycle(.{ .assistant = assistant }) catch |err| self.recordCallbackError(err);
         self.emitFailure(text) catch |err| self.recordCallbackError(err);
     }
 
@@ -1175,11 +1187,10 @@ pub const AgentSession = struct {
         var started = try events.MessageStarted.init(self.gpa, id, role);
         defer started.deinit(self.gpa);
         try self.emit(.{ .message_started = started });
-        var finished = try events.MessageFinished.init(
-            self.gpa,
-            id,
-            if (value == .assistant) value.assistant.stop_reason else null,
-        );
+        var finished = if (value == .assistant)
+            try events.MessageFinished.initAssistant(self.gpa, id, value.assistant)
+        else
+            try events.MessageFinished.init(self.gpa, id, null, &.{}, null);
         defer finished.deinit(self.gpa);
         try self.emit(.{ .message_finished = finished });
     }
@@ -1512,6 +1523,89 @@ fn drainRun(io: std.Io, allocator: Allocator, session: *AgentSession) !void {
         if (finished) return;
     }
     return error.EventOutboxClosed;
+}
+
+test "prompt command queues an initial turn while a run is active" {
+    const openai_compatible = @import("openai_compatible");
+    const mock_transport = @import("../testkit/mock_transport.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var mock = mock_transport.MockTransport.init(&.{});
+    const factory = openai_compatible.createOpenAiCompatible(.{
+        .provider_name = "phase-2b-test",
+        .base_url = "https://example.test/v1",
+        .api_key = "dummy-key",
+        .transport = mock.transport(),
+    });
+    var chat = try factory.chatModel("smoke-model", null);
+    var registry = tool_api.ToolRegistry.init(allocator);
+    defer registry.deinit();
+    var session = try AgentSession.init(allocator, io, .{
+        .model = .{
+            .language_model = .{ .model = chat.languageModel() },
+            .provider_name = "phase-2b-test",
+            .model_id = "smoke-model",
+        },
+        .tools = &registry,
+    });
+    defer session.deinit();
+    session.running.store(true, .release);
+    defer session.running.store(false, .release);
+    var prompt = try events.OwnedPrompt.init(allocator, "next turn", &.{}, false, .user);
+    defer prompt.deinit(allocator);
+
+    try session.handlePrompt(prompt);
+
+    session.state_mutex.lockUncancelable(io);
+    defer session.state_mutex.unlock(io);
+    try std.testing.expectEqual(@as(usize, 1), session.initial_queue.items.len);
+    try std.testing.expectEqualStrings("next turn", session.initial_queue.items[0].text);
+    try std.testing.expectEqual(@as(usize, 0), session.steering_queue.items.len);
+    try std.testing.expect(session.outbox().tryPop(io) == null);
+}
+
+test "persisted internal failure emits a terminal assistant event before failed" {
+    const openai_compatible = @import("openai_compatible");
+    const mock_transport = @import("../testkit/mock_transport.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var mock = mock_transport.MockTransport.init(&.{});
+    const factory = openai_compatible.createOpenAiCompatible(.{
+        .provider_name = "phase-2b-test",
+        .base_url = "https://example.test/v1",
+        .api_key = "dummy-key",
+        .transport = mock.transport(),
+    });
+    var chat = try factory.chatModel("smoke-model", null);
+    var registry = tool_api.ToolRegistry.init(allocator);
+    defer registry.deinit();
+    var session = try AgentSession.init(allocator, io, .{
+        .model = .{
+            .language_model = .{ .model = chat.languageModel() },
+            .provider_name = "phase-2b-test",
+            .model_id = "smoke-model",
+        },
+        .tools = &registry,
+    });
+    defer session.deinit();
+
+    session.persistFailure("persistence write failed");
+
+    var started = session.outbox().tryPop(io).?;
+    defer started.deinit(allocator);
+    try std.testing.expect(started == .message_started);
+    var finished = session.outbox().tryPop(io).?;
+    defer finished.deinit(allocator);
+    try std.testing.expect(finished == .message_finished);
+    try std.testing.expectEqual(message.StopReason.@"error", finished.message_finished.stop_reason.?);
+    try std.testing.expectEqualStrings("persistence write failed", finished.message_finished.error_message.?);
+    var failed = session.outbox().tryPop(io).?;
+    defer failed.deinit(allocator);
+    try std.testing.expect(failed == .failed);
+    try std.testing.expectEqualStrings("persistence write failed", failed.failed.message);
+    try std.testing.expect(session.outbox().tryPop(io) == null);
+    try std.testing.expectEqual(@as(usize, 1), session.messagesBorrowed().len);
+    try std.testing.expectEqual(message.StopReason.@"error", session.messagesBorrowed()[0].assistant.stop_reason);
 }
 
 test "agent retry delay uses exact exponential defaults and cap" {

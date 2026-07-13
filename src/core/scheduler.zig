@@ -458,8 +458,9 @@ fn normalizeOutcome(arena: Allocator, source: tool_api.ToolOutcome) !tool_api.To
     return errorOutcome(arena, EMPTY_ERROR_OUTPUT);
 }
 
-fn sanitizeText(arena: Allocator, source: []const u8) ![]const u8 {
+pub fn sanitizeText(arena: Allocator, source: []const u8) ![]const u8 {
     const without_ansi = try stripAnsi(arena, source);
+    defer arena.free(without_ansi);
     const malformed = !std.unicode.utf8ValidateSlice(without_ansi);
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(arena);

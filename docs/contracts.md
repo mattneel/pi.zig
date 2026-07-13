@@ -24,6 +24,13 @@ implemented and test-covered · `[open]` undecided.
   content becomes `"Tool failed with no output."`.
 - Provider errors/aborts end the run with a persisted assistant message
   (`stopReason: error|aborted`) — frontends never see an exception.
+- **[verified]** A `.prompt` command received during an active run is retained
+  in the initial-turn queue. It starts a fresh generation after the current
+  generation settles; it is never converted to steering or discarded.
+- **[verified]** An internal run failure emits the synthesized assistant's
+  terminal `message_finished`, then `failed`, and closes the generation with
+  `run_finished(status: failed)`. This remains true when persisting the
+  synthesized assistant also fails.
 - An exclusive tool serializes against the whole batch; shared tools run
   concurrently; results are assembled in call order.
 
@@ -55,6 +62,45 @@ Three layers, matching ai.zig's model:
   images ≥ 1024 chars live in the content-addressed blob store.
 - The `ModelMessage` core of every message entry round-trips through
   ai.zig's canonical wire codec byte-stably.
+
+## CLI, settings, and non-interactive modes `[verified]`
+
+- The Phase 2b parser accepts only `--cwd`, `--model`, `--thinking`,
+  `-p`/`--print`, `--mode text|json`, `--resume`/`-r`, `--continue`/`-c`,
+  `--no-session`, `--session-dir`, repeated `--config`, `--api-key`,
+  `--tools`, `--no-tools`, `--system-prompt`, `--append-system-prompt`,
+  `--version`/`-v`, and `--help`/`-h`. `--flag=value`, `--`, positional
+  prompt ordering, and unknown-flag exit code 2 are test-covered. Help and
+  version take precedence over other argument errors.
+- Settings merge in this order: built-in defaults, global JSON, cwd-local
+  project JSON, repeated JSON overlays, then runtime CLI values. Objects merge
+  recursively; scalars and arrays replace the lower layer. A required overlay
+  that is absent, malformed, or not an object is an error.
+- API keys resolve from the runtime argument, then the models config, then the
+  provider environment map. Key bytes are retained only for provider setup and
+  the active run; they are never written to session, history, stdout, or
+  stderr.
+- Print and JSON modes drive `AgentSession.run` through the command inbox and
+  consume only owned `AgentEvent` values from the outbox. `message_finished`
+  owns the final assistant text blocks and optional error text needed by a
+  frontend; no frontend reads the session message arena.
+- Text mode writes only the last assistant message's text blocks. Final
+  `error` or `aborted` messages flush stdout, write the error text to stderr,
+  and return exit code 1. A final `run_finished(status: failed)` also returns 1
+  even if no model-produced terminal message exists. JSON mode writes the
+  canonical session header first, then exactly one JSON object per emitted
+  event line, and returns 0 after flushing stdout.
+- `--no-session`, custom session directories, newest-session continue, and
+  path/id/filename-prefix resume are deterministic. A cross-project resume is
+  declined without an interactive move/fork prompt. Empty CLI or configured
+  model selectors remain unset. Submitted prompts append to
+  consecutive-deduplicated JSONL history on a best-effort basis; dedupe reads
+  only the last record and concurrent writers hold the file lock through the
+  check and single-record write.
+- A system-prompt argument is read as a file only when it names an openable
+  file. Missing paths, non-directory components, invalid path names, and
+  overlong path components leave the argument as literal prompt text; actual
+  file read failures still propagate.
 
 ## Model-facing byte parity `[planned]`
 
@@ -98,5 +144,3 @@ parent `task` approval boundary.
 - **[open]** Windows support tier (ConPTY bash, suspend semantics).
 - **[open]** Duplicate tool-call ids within one response (inherits
   ai.zig's last-write-wins; needs a defined contract + test here too).
-- **[open]** Whether print mode replays `AgentEvent`s from a `--resume`d
-  session or always starts a fresh run (match upstream when reached).
