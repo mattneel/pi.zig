@@ -224,7 +224,8 @@ fn lowerAssistant(
                 .value = redacted.data,
             }}),
         } }),
-        .fallback, .unknown => {},
+        .fallback => {},
+        .unknown => |raw| if (try lowerRawAssistantBlock(arena, raw)) |part| try parts.append(arena, part),
         .tool_call => |call| try parts.append(arena, .{ .tool_call = .{
             .tool_call_id = try arena.dupe(u8, call.id),
             .tool_name = try arena.dupe(u8, call.name),
@@ -234,6 +235,19 @@ fn lowerAssistant(
     };
     if (parts.items.len == 0) return null;
     return .{ .assistant = .{ .content = .{ .parts = try parts.toOwnedSlice(arena) } } };
+}
+
+fn lowerRawAssistantBlock(arena: Allocator, raw: std.json.Value) !?ai.message.AssistantContentPart {
+    if (raw != .object) return null;
+    const type_value = raw.object.get("type") orelse return null;
+    if (type_value != .string or !std.mem.eql(u8, type_value.string, "custom")) return null;
+    const kind_value = raw.object.get("kind") orelse return null;
+    if (kind_value != .string) return null;
+    const metadata = raw.object.get("providerMetadata") orelse raw.object.get("providerOptions");
+    return .{ .custom = .{
+        .kind = try arena.dupe(u8, kind_value.string),
+        .provider_options = if (metadata) |value| try provider_utils.cloneJsonValue(arena, value) else null,
+    } };
 }
 
 fn appendToolResultRun(

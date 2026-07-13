@@ -117,9 +117,10 @@ steering boundaries, shared/exclusive tool concurrency, interruptible-tool
 polling, inline approval prompts, `pause_turn` re-sampling, `length`-stop
 placeholder pairing, unbounded steps (`research/agent-ai-mapping.md` §3.1).
 What we lease from ai.zig per step: provider wire formats, SSE streaming,
-retry engine (408/409/429/5xx, 2 retries), schema validation of tool
-inputs, reasoning/thinking mapping, prompt-cache options, structured
-output, MCP tool defs, and the canonical message codec.
+retryability diagnostics (the built-in retry count is set to zero so
+`AgentSession` owns the ten-attempt ladder), schema validation of tool inputs,
+reasoning/thinking mapping, prompt-cache options, structured output, MCP tool
+defs, and the canonical message codec.
 
 Integration facts (verified, `research/ai-zig-surface.md`):
 
@@ -158,7 +159,8 @@ outer: while true:
     length-stop with calls → placeholder results, re-sample
     pause_turn with no calls → re-sample (max 8 consecutive)
     soft tool requirement: non-compliant turn → skip all calls with
-      "Not executed: call the `X` tool …", force {tool,name} one turn
+      "Tool call was not executed because the assistant ended its turn:
+      Not executed: call the `X` tool …", force {tool,name} one turn
       (max 3 escalations)
     else execute tool batch (below)
     turn_end
@@ -191,8 +193,9 @@ become error results — never batch aborts; empty error content becomes
 `MAX_SOFT_TOOL_ESCALATIONS = 3`, steering poll 250 ms,
 `UNEXPECTED_STOP_MAX_RETRIES = 3`, `EMPTY_STOP_MAX_RETRIES = 3`,
 unexpected-stop backoff cap 8000 ms. Auto-retry of transient provider
-errors: maxRetries 10, base 500 ms, cap 300 000 ms, model-fallback chains,
-`fallbackRevertPolicy: cooldown-expiry`.
+errors: maxRetries 10, base 500 ms, exponential cap 8000 ms, fail-fast when a
+provider-directed wait exceeds 300 000 ms without a fallback,
+model-fallback chains, `fallbackRevertPolicy: cooldown-expiry`.
 
 **Errors are data.** Provider failures/aborts terminate the run gracefully
 with a persisted assistant message (`stopReason: error|aborted`,
@@ -517,6 +520,31 @@ Track every deviation here; anything not listed is a bug.
     through `.content`; empty and single-text errors use `.error_text`. The Pi
     message retains `isError`, so this can be removed when ai.zig exposes an
     error-content variant.
+23. Phase 1b accepts pre-resolved `ModelTarget` values and explicit per-role
+    fallback chains. Upstream's selector parsing, `provider/*` wildcard
+    expansion, credential suppression, and cooldown-expiry restoration require
+    the Phase 2 settings/auth layer; until then a successful fallback is scoped
+    to the failed model call and the configured primary is retried on the next
+    logical turn.
+24. Unexpected-stop classification is dependency-injected into `AgentSession`
+    instead of selecting and calling the upstream tiny/smol classifier inside
+    the core library. A `true` decision has the same three-reminder cap and
+    byte-identical embedded reminder; an absent or indeterminate classifier
+    disables the heuristic.
+25. Provider retry backoff is deterministic rather than applying upstream's
+    random 0–25% jitter so library tests and embedding schedulers remain
+    reproducible. The 500 ms exponential base, 8 s exponential cap, retry
+    count, fallback boundaries, and fail-fast when a provider-directed wait
+    exceeds `retry.maxDelayMs` without a fallback match upstream.
+26. Empty-stop and classifier-confirmed unexpected-stop continuations stay in
+    the current `AgentSession` run generation. Upstream schedules them through
+    its session-maintenance queue, producing an extra agent start/end pair; the
+    in-memory Phase 1b core has no session-maintenance task, while message
+    cleanup, reminders, caps, and model-call behavior are preserved.
+27. Persisted tool-result messages are appended in tool-call order after the
+    batch settles rather than interleaving in tool-completion order. Per-tool
+    `tool_finished` events still fire in completion order; deterministic
+    persisted ordering is the intentional simplification.
 
 ## 17. Phase-0 specifics (for the first implementation task)
 
