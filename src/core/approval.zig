@@ -6,6 +6,59 @@
 
 const std = @import("std");
 
+pub const default_prompt_truncate_chars: usize = 2000;
+
+/// Keep approval details bounded using JavaScript string-length semantics.
+/// The prefix ends on a complete UTF-8 code point because Zig strings cannot
+/// represent the unpaired surrogate that JavaScript may produce at a boundary.
+pub fn truncateForPrompt(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    max_chars: usize,
+) ![]const u8 {
+    const total_chars = utf16CodeUnits(value);
+    if (total_chars <= max_chars) return value;
+
+    var index: usize = 0;
+    var chars: usize = 0;
+    while (index < value.len) {
+        const sequence_len = std.unicode.utf8ByteSequenceLength(value[index]) catch 1;
+        if (index + sequence_len > value.len) break;
+        const codepoint = std.unicode.utf8Decode(value[index .. index + sequence_len]) catch {
+            if (chars + 1 > max_chars) break;
+            chars += 1;
+            index += 1;
+            continue;
+        };
+        const width: usize = if (codepoint > 0xFFFF) 2 else 1;
+        if (chars + width > max_chars) break;
+        chars += width;
+        index += sequence_len;
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}[…{d}ch elided…]",
+        .{ value[0..index], total_chars - max_chars },
+    );
+}
+
+fn utf16CodeUnits(value: []const u8) usize {
+    var index: usize = 0;
+    var count: usize = 0;
+    while (index < value.len) {
+        const sequence_len = std.unicode.utf8ByteSequenceLength(value[index]) catch 1;
+        if (index + sequence_len > value.len) return count + value.len - index;
+        const codepoint = std.unicode.utf8Decode(value[index .. index + sequence_len]) catch {
+            count += 1;
+            index += 1;
+            continue;
+        };
+        count += if (codepoint > 0xFFFF) 2 else 1;
+        index += sequence_len;
+    }
+    return count;
+}
+
 pub const ToolTier = enum(u2) {
     read,
     write,

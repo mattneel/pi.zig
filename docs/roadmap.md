@@ -4,12 +4,14 @@
 reports); porting guide and contracts drafted; **Phase 0 complete**
 (deps wired, skeleton, three dependency smokes); **Phase 0b complete**
 (hashline engine, 222/222 upstream corpus cases, adversarial review
-fixes). **Phase 1 in progress:** 1a foundations landed (message model +
-lowering, session entries, catalog, truncation core, approval table,
-event contract — reviewed, 398/398 tests); 1b landed (the loop:
-scheduler, mailboxes, raise/lower round-trip, AgentSession, retry ladder
-— four-reviewer pass, 434/434 tests). **Next: 1c — the four essential
-tools (read, bash, edit, write) on the tool.zig seam.**
+fixes). **Phase 1 COMPLETE** — a headless agent that reads and edits real files
+through a genuine model loop: 1a foundations (message model + lowering,
+session entries, catalog, truncation core, approval table, events),
+1b the loop (scheduler, mailboxes, raise/lower round-trip, AgentSession,
+retry ladder), 1c the four essential tools (read, bash, edit, write) on
+the tool.zig seam with an end-to-end read→snapshot→edit integration test.
+Every subsystem multi-reviewed against upstream; 461/461 tests.
+**Next: Phase 2 — print/JSON modes + JSONL session persistence.**
 
 Phased implementation plan. Ordering is forced by the upstream dependency
 spine (hashline → catalog → agent core → tools → session → modes → TUI →

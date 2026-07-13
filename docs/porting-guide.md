@@ -545,6 +545,72 @@ Track every deviation here; anything not listed is a bug.
     batch settles rather than interleaving in tool-completion order. Per-tool
     `tool_finished` events still fire in completion order; deterministic
     persisted ordering is the intentional simplification.
+28. Phase 1c `read` accepts local filesystem paths only. HTTP/HTTPS and `www.`
+    targets return an explicit unsupported-result message; web fetching and
+    its cached pagination land with the web-tool phase.
+29. Phase 1c `read` does not route `agent://`, `artifact://`, `history://`,
+    `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`,
+    `rule://`, `skill://`, or `vault://` resources. The internal URL router is
+    deferred until those resource owners exist.
+30. Phase 1c `read` does not inspect tar, tgz, or zip archives. Archive member
+    indexing, decompression, size caps, and member selectors are deferred.
+31. Phase 1c `read` does not inspect SQLite databases. Table discovery, row
+    selectors, validated queries, and render caps are deferred.
+32. Phase 1c `read` treats PDF, office, RTF, EPUB, and notebook conversion as
+    unsupported. Document extraction and editable notebook conversion are
+    deferred.
+33. Phase 1c `read` does not decode or attach images. Content-based image
+    detection, metadata, resizing, and model media blocks are deferred.
+34. Phase 1c `read` returns bounded plain text when no selector is present.
+    Tree-sitter structural summaries and summary memoization are deferred.
+35. Phase 1c `read` does not recover missing paths through a unique suffix
+    glob. A missing local path remains a direct not-found result until the glob
+    tool and its timeout policy land.
+36. Phase 1c `bash` omits asynchronous/background execution from its schema.
+    Managed jobs and later result delivery are deferred.
+37. Phase 1c `bash` has no PTY path. Commands always use the non-interactive
+    pipe path; terminal allocation, input forwarding, and terminal resize are
+    deferred.
+38. Phase 1c `bash` starts one system-shell process per call. Persistent shell
+    reuse, rc snapshots, and failed-shell quarantine are deferred, extending
+    the system-shell adaptation in ledger entry 1.
+39. Phase 1c `bash` does not intercept commands and redirect them to dedicated
+    tools. The configured interceptor rule set is deferred.
+40. Phase 1c `bash` does not automatically convert a long foreground command
+    into a background job. Auto-background thresholds and job handoff are
+    deferred.
+41. Phase 1c `bash` preserves bounded raw command output. Test/lint output
+    minimization and the original-output artifact footer are deferred.
+42. Phase 1c `bash` keeps the ordinary exec approval tier for every command.
+    Critical-pattern detection and approval escalation are deferred.
+43. Phase 1c `edit` exposes hashline mode only. Replace mode and its fuzzy
+    matching pipeline are deferred.
+44. Phase 1c `edit` defers both context-patch and Codex `apply_patch` modes and
+    their alternate schemas and constrained-decoding formats.
+45. Phase 1c keeps hashline mode for every model. The Kimi-family fallback to
+    replace mode is deferred until model-aware settings reach the tool builder.
+46. Phase 1c `edit` writes through the real filesystem adapter. LSP/ACP
+    writethrough, format-on-write, and post-write diagnostics are deferred.
+47. Phase 1c `write` accepts plain local paths only. Writable internal URLs and
+    their handler-specific approval tiers are deferred.
+48. Phase 1c `write` does not resolve `conflict://` regions. Single and bulk
+    merge-conflict splicing are deferred.
+49. Phase 1c `write` does not rewrite archive members. Tar/tgz/zip writeback
+    and archive path validation are deferred.
+50. Phase 1c `write` does not insert, update, or delete SQLite rows. SQLite
+    target parsing, JSON5 values, and primary-key handling are deferred.
+51. Phase 1c `write` writes directly through `std.Io`. ACP/LSP writethrough,
+    format-on-write, diagnostics, and filesystem-scan cache invalidation are
+    deferred.
+52. Phase 1c directory reads prune a local set of standard non-source
+    directories (`.git`, `node_modules`, common build outputs, and caches).
+    This approximates the native workspace walker's ignore rules until that
+    walker is ported.
+53. Phase 1c `bash` builds its child environment from the parent process, then
+    applies non-interactive hardening values and caller overrides. Upstream
+    starts from its controlled command/session environment; inheriting the base
+    keeps command lookup working until shell-snapshot environment capture is
+    ported.
 
 ## 17. Phase-0 specifics (for the first implementation task)
 
