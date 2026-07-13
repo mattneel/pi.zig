@@ -12,6 +12,7 @@ const testkit = @import("../testkit/mock_transport.zig");
 const Allocator = std.mem.Allocator;
 const double_ctrl_c_ms: i64 = 500;
 const spinner_frame_ms: i64 = 80;
+const max_composer_height: u16 = 8;
 
 const transcript_theme: tuizr.TranscriptTheme = .{
     .markdown = .{
@@ -111,7 +112,9 @@ const State = struct {
     last_ctrl_c_ms: ?i64 = null,
 
     fn init() State {
-        return .{ .composer = tuizr.TextInput.init() };
+        var composer = tuizr.TextInput.init();
+        composer.multiline = true;
+        return .{ .composer = composer };
     }
 };
 
@@ -161,8 +164,8 @@ pub fn run(
             try bridgeEvent(gpa, io, session, state, event);
         }
 
-        updateTranscriptViewport(state, term.backBuffer());
         while (term.pollInput()) |key_event| {
+            _ = updateTranscriptViewport(state, term.backBuffer());
             try handleKey(gpa, io, session, state, clock, key_event);
             if (state.quit_requested) break;
         }
@@ -350,7 +353,6 @@ fn handleKey(
         }
         return;
     }
-    if (key_event.key == .enter) return;
 
     _ = tuizr.textInputHandleKey(&state.composer, key_event);
 }
@@ -375,9 +377,38 @@ fn clearComposer(composer: *tuizr.TextInput) void {
     composer.submitted_len = 0;
 }
 
-fn updateTranscriptViewport(state: *State, grid: *const tuizr.CellGrid) void {
+const Layout = struct {
+    transcript_height: u16 = 0,
+    composer_y: u16 = 0,
+    composer_height: u16 = 0,
+    status_y: u16 = 0,
+};
+
+fn calculateLayout(state: *const State, width: u16, height: u16) Layout {
+    if (height == 0) return .{};
+
+    const status_y = height - 1;
+    if (height == 1) return .{ .status_y = status_y };
+
+    const composer_limit = @min(max_composer_height, height / 2);
+    const composer_height = @min(
+        @max(tuizr.textInputLineCount(&state.composer, width), 1),
+        composer_limit,
+    );
+    const transcript_height = height - composer_height - 1;
+    return .{
+        .transcript_height = transcript_height,
+        .composer_y = transcript_height,
+        .composer_height = composer_height,
+        .status_y = status_y,
+    };
+}
+
+fn updateTranscriptViewport(state: *State, grid: *const tuizr.CellGrid) Layout {
+    const layout = calculateLayout(state, grid.width(), grid.height());
     state.transcript_width = grid.width();
-    state.transcript_viewport_height = grid.height() -| 2;
+    state.transcript_viewport_height = layout.transcript_height;
+    return layout;
 }
 
 fn spinnerTick(state: *State, now_ms: i64) usize {
@@ -433,46 +464,49 @@ fn draw(
     const width = grid.width();
     const height = grid.height();
     if (height == 0) return;
-    updateTranscriptViewport(state, grid);
+    const layout = updateTranscriptViewport(state, grid);
 
-    const transcript_height = height -| 2;
-    if (transcript_height != 0) {
+    if (layout.transcript_height != 0) {
         tuizr.drawTranscript(
             grid,
-            .{ .x = 0, .y = 0, .w = width, .h = transcript_height },
+            .{ .x = 0, .y = 0, .w = width, .h = layout.transcript_height },
             &state.transcript,
             transcript_theme,
         );
     }
 
-    const composer_y = if (height >= 2) height - 2 else 0;
-    tuizr.drawTextInput(
-        grid,
-        .{ .x = 0, .y = composer_y, .w = width, .h = 1 },
-        &state.composer,
-        composer_style,
-        true,
-    );
-
-    if (height >= 2) {
-        var left_buffer: [256]u8 = undefined;
-        const left = formatStatusLeft(&left_buffer, state);
-        var right_buffer: [512]u8 = undefined;
-        const right = std.fmt.bufPrint(
-            &right_buffer,
-            "{s} • {s}",
-            .{ model_label, @tagName(thinking) },
-        ) catch @tagName(thinking);
-        tuizr.drawStatusBar(
+    if (layout.composer_height != 0) {
+        tuizr.drawTextInput(
             grid,
-            .{ .x = 0, .y = height - 1, .w = width, .h = 1 },
-            left,
-            right,
-            status_style,
+            .{
+                .x = 0,
+                .y = layout.composer_y,
+                .w = width,
+                .h = layout.composer_height,
+            },
+            &state.composer,
+            composer_style,
+            true,
         );
-        if (state.is_running and width != 0) {
-            tuizr.drawSpinner(grid, 0, height - 1, spinner_tick, status_style);
-        }
+    }
+
+    var left_buffer: [256]u8 = undefined;
+    const left = formatStatusLeft(&left_buffer, state);
+    var right_buffer: [512]u8 = undefined;
+    const right = std.fmt.bufPrint(
+        &right_buffer,
+        "{s} • {s}",
+        .{ model_label, @tagName(thinking) },
+    ) catch @tagName(thinking);
+    tuizr.drawStatusBar(
+        grid,
+        .{ .x = 0, .y = layout.status_y, .w = width, .h = 1 },
+        left,
+        right,
+        status_style,
+    );
+    if (state.is_running and width != 0) {
+        tuizr.drawSpinner(grid, 0, layout.status_y, spinner_tick, status_style);
     }
 }
 
@@ -651,6 +685,9 @@ test "consecutive assistant deltas append to one transcript block" {
 test "composed assistant frame shows usage model and thinking in the status bar" {
     var state = State.init();
     try applyComposedFrameScript(std.testing.allocator, &state);
+    for ("draft") |byte| {
+        _ = tuizr.textInputHandleKey(&state.composer, keyCharacter(byte));
+    }
     var grid = try tuizr.CellGrid.init(std.testing.allocator, 48, 6);
     defer grid.deinit();
 
@@ -658,23 +695,94 @@ test "composed assistant frame shows usage model and thinking in the status bar"
     const projection = try gridProjectionAlloc(std.testing.allocator, &grid);
     defer std.testing.allocator.free(projection);
     try std.testing.expectEqualStrings(
-        "Hi\n\n\n\n\n" ++
+        "Hi\n\n\n\ndraft\n" ++
             "ready ↑120 ↓34 R5 $0.0123 43%  test-model • high\n",
         projection,
     );
 
     const assistant = grid.getCell(0, 0) orelse return error.TestUnexpectedResult;
     const composer = grid.getCell(0, 4) orelse return error.TestUnexpectedResult;
+    const composer_cursor = grid.getCell(5, 4) orelse return error.TestUnexpectedResult;
     const status = grid.getCell(0, 5) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(transcript_theme.markdown.text.attrs, assistant.attrs);
     try expectCellColors(transcript_theme.markdown.text, assistant);
-    try std.testing.expectEqual(composer_style.attrs | tuizr.Attr.reverse, composer.attrs);
+    try std.testing.expectEqual(composer_style.attrs, composer.attrs);
     try expectCellColors(composer_style, composer);
+    try std.testing.expectEqual(composer_style.attrs | tuizr.Attr.reverse, composer_cursor.attrs);
+    try expectCellColors(composer_style, composer_cursor);
     try std.testing.expectEqual(status_style.attrs, status.attrs);
     try expectCellColors(status_style, status);
+    try std.testing.expect(state.composer.multiline);
+    try std.testing.expectEqual(@as(u16, 1), tuizr.textInputLineCount(&state.composer, grid.width()));
+    try std.testing.expectEqual(@as(u16, 4), state.transcript_viewport_height);
     try std.testing.expect(!state.is_running);
     try std.testing.expectEqual(@as(u64, 120), state.usage.?.usage.input);
     try std.testing.expectEqual(@as(?f64, 42.6), state.usage.?.context_percent);
+}
+
+test "newline keys expand the composer without submitting" {
+    const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
+    defer fixture.deinit();
+    var state = State.init();
+    var now_ms: i64 = 0;
+    const clock: Clock = .{ .fixed_ms = &now_ms };
+
+    tuizr.transcriptStartBlock(&state.transcript, .notice);
+    tuizr.transcriptAppend(&state.transcript, "above");
+    tuizr.transcriptFinalize(&state.transcript);
+    for ("one") |byte| {
+        _ = tuizr.textInputHandleKey(&state.composer, keyCharacter(byte));
+    }
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &state,
+        clock,
+        .{ .key = .enter, .codepoint = 0, .modifiers = .{ .shift = true } },
+    );
+    for ("two") |byte| {
+        _ = tuizr.textInputHandleKey(&state.composer, keyCharacter(byte));
+    }
+
+    try std.testing.expectEqualStrings("one\ntwo", state.composer.buffer[0..state.composer.len]);
+    try std.testing.expectEqual(@as(u16, 2), tuizr.textInputLineCount(&state.composer, 20));
+    try std.testing.expect(fixture.session.inbox().tryPop(std.testing.io) == null);
+
+    var grid = try tuizr.CellGrid.init(std.testing.allocator, 20, 6);
+    defer grid.deinit();
+    draw(&state, &grid, "model", .low, 0);
+    const projection = try gridProjectionAlloc(std.testing.allocator, &grid);
+    defer std.testing.allocator.free(projection);
+    try std.testing.expectEqualStrings(
+        "above\n\n\none\ntwo\n" ++
+            "ready    model • low\n",
+        projection,
+    );
+    try std.testing.expectEqual(@as(u16, 3), state.transcript_viewport_height);
+    try expectCellColors(composer_style, grid.getCell(0, 3) orelse return error.TestUnexpectedResult);
+    try expectCellColors(composer_style, grid.getCell(0, 4) orelse return error.TestUnexpectedResult);
+
+    var ctrl_j_state = State.init();
+    _ = tuizr.textInputHandleKey(&ctrl_j_state.composer, keyCharacter('a'));
+    try handleKey(
+        std.testing.allocator,
+        std.testing.io,
+        &fixture.session,
+        &ctrl_j_state,
+        clock,
+        .{
+            .key = .character,
+            .codepoint = 'j',
+            .modifiers = .{ .ctrl = true },
+        },
+    );
+    _ = tuizr.textInputHandleKey(&ctrl_j_state.composer, keyCharacter('b'));
+    try std.testing.expectEqualStrings(
+        "a\nb",
+        ctrl_j_state.composer.buffer[0..ctrl_j_state.composer.len],
+    );
+    try std.testing.expect(fixture.session.inbox().tryPop(std.testing.io) == null);
 }
 
 test "running status draws an injected spinner frame" {
