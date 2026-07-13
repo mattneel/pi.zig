@@ -28,10 +28,14 @@ Both the transcript and markdown are reusable tuizr widgets (widget-ownership
 principle: generic UI → tuizr, agent glue → pi.zig); shaking out the real
 terminal surfaced and fixed several tuizr core bugs (raw-mode + size ownership,
 non-blocking input, Ctrl+C encoding, and additive-SGR / tile-boundary / wide-
-glyph encoder corruption). **Next: Phase 3c — status line (model • thinking •
-cost), working spinner, scroll-back keys, and composer depth (kill-ring,
-history, paste-collapse, sigils, autocomplete), extending tuizr's editor +
-input parser.**
+glyph encoder corruption). **Phase 3c MOSTLY COMPLETE** — the interactive
+daily-driver is there: status line (model • thinking • `↑in ↓out $cost ctx%`),
+working spinner, scroll-back keys, and a rich multiline composer (paste-collapse,
+kill-ring, undo, ctrl-shortcuts) over widened input (ctrl-byte normalization,
+bracketed paste). Deferred to ride with their Phase 5 features: the `!`/`/`
+sigils and slash/file autocomplete. **Next: Phase 4 (compaction) or Phase 5
+(glob/grep/todo, approval UI, slash commands + the deferred composer sigils/
+autocomplete).**
 
 Phased implementation plan. Ordering is forced by the upstream dependency
 spine (hashline → catalog → agent core → tools → session → modes → TUI →
@@ -147,11 +151,17 @@ mapping, Pi's key/Ctrl+C/sigil semantics).
   caches, immutable-once-finalized, one-blank-separator, internal virtualized
   scroll; a cached streaming-markdown widget (upstream subset minus LaTeX/
   mermaid/OSC-66). pi.zig maps each `AgentEvent` to a block.
-- **3c — composer depth + chrome (tuizr widgets).** Extend `TextInput` into a
-  rich editor (multiline, kill ring, undo, paste collapse, sigils, slash/file
-  autocomplete); status line + footer + working loader; the full Esc ladder and
-  Enter-while-streaming semantics; extend tuizr's input parser + `Key` enum for
-  the richer keybindings.
+- **3c — composer depth + chrome (MOSTLY COMPLETE).** DONE: status line
+  (`model • thinking` + `↑in ↓out $cost ctx%` from `usage_updated`) + working
+  braille spinner + transcript scroll-back keys (tuizr `StatusBar`/`Spinner`
+  widgets); a rich editor (tuizr `TextInput`: multiline via shift+enter, kill
+  ring + yank/yank-pop, undo, large-paste collapse to `[Paste #N]` expanded on
+  submit) with the input parser widened (ctrl+letter normalization, bracketed
+  paste). Wired in pi.zig with a dynamic composer height. DEFERRED to ride with
+  Phase 5 (they need slash commands + the bash/tool surfaces that land there):
+  the `!`/`!!` bash and `/` slash sigils and the slash/file autocomplete popup;
+  `->`/`=>` follow-up and `.`/`c` continue are small pi.zig follow-ups. The full
+  Esc ladder beyond streaming-cancel also arrives with those interactions.
 
 **Accept:** widget-render tests in tuizr; pi.zig `CellGrid`-projection goldens
 (streaming at bottom, scrolled-up, huge output, narrow terminal) + bridge/key
