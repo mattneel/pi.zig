@@ -13,6 +13,11 @@ const Allocator = std.mem.Allocator;
 const double_ctrl_c_ms: i64 = 500;
 const spinner_frame_ms: i64 = 80;
 const max_composer_height: u16 = 8;
+const max_in_flight_tools: usize = 8;
+const max_tool_call_id_bytes: usize = 256;
+const max_tool_name_bytes: usize = 256;
+const max_buffered_tool_output_bytes: usize = 8 * 1024;
+const buffered_tool_output_truncation_marker = "…[output truncated]";
 
 const transcript_theme: tuizr.TranscriptTheme = .{
     .markdown = .{
@@ -99,9 +104,89 @@ const Clock = union(enum) {
     }
 };
 
+const InFlightToolCall = struct {
+    tool_call_id: [max_tool_call_id_bytes]u8 = undefined,
+    tool_call_id_len: usize = 0,
+    tool_call_id_source_len: usize = 0,
+    tool_call_id_hash: u64 = 0,
+    tool_name: [max_tool_name_bytes]u8 = undefined,
+    tool_name_len: usize = 0,
+    output: [max_buffered_tool_output_bytes]u8 = undefined,
+    output_len: usize = 0,
+    output_truncated: bool = false,
+    finished: bool = false,
+    is_error: bool = false,
+
+    fn init(tool_call_id: []const u8, tool_name: []const u8) InFlightToolCall {
+        var result: InFlightToolCall = .{};
+
+        result.tool_call_id_len = @min(tool_call_id.len, max_tool_call_id_bytes);
+        @memcpy(
+            result.tool_call_id[0..result.tool_call_id_len],
+            tool_call_id[0..result.tool_call_id_len],
+        );
+        result.tool_call_id_source_len = tool_call_id.len;
+        result.tool_call_id_hash = std.hash.XxHash64.hash(0, tool_call_id);
+
+        result.tool_name_len = @min(tool_name.len, max_tool_name_bytes);
+        @memcpy(
+            result.tool_name[0..result.tool_name_len],
+            tool_name[0..result.tool_name_len],
+        );
+        return result;
+    }
+
+    fn matches(self: *const InFlightToolCall, tool_call_id: []const u8, id_hash: u64) bool {
+        if (self.tool_call_id_source_len != tool_call_id.len or
+            self.tool_call_id_hash != id_hash)
+        {
+            return false;
+        }
+        return std.mem.eql(
+            u8,
+            self.tool_call_id[0..self.tool_call_id_len],
+            tool_call_id[0..self.tool_call_id_len],
+        );
+    }
+
+    fn name(self: *const InFlightToolCall) []const u8 {
+        return self.tool_name[0..self.tool_name_len];
+    }
+
+    fn bufferedOutput(self: *const InFlightToolCall) []const u8 {
+        return self.output[0..self.output_len];
+    }
+
+    fn appendBufferedOutput(self: *InFlightToolCall, bytes: []const u8) void {
+        if (bytes.len == 0 or self.output_truncated) return;
+
+        const available = max_buffered_tool_output_bytes - self.output_len;
+        const retained_len = @min(bytes.len, available);
+        @memcpy(
+            self.output[self.output_len .. self.output_len + retained_len],
+            bytes[0..retained_len],
+        );
+        self.output_len += retained_len;
+
+        if (retained_len != bytes.len) {
+            const marker_start = max_buffered_tool_output_bytes -
+                buffered_tool_output_truncation_marker.len;
+            @memcpy(
+                self.output[marker_start..max_buffered_tool_output_bytes],
+                buffered_tool_output_truncation_marker,
+            );
+            self.output_len = max_buffered_tool_output_bytes;
+            self.output_truncated = true;
+        }
+    }
+};
+
 const State = struct {
     transcript: tuizr.Transcript = .{},
     current_kind: ?tuizr.BlockKind = null,
+    tool_calls: [max_in_flight_tools]InFlightToolCall = undefined,
+    tool_head: usize = 0,
+    tool_count: usize = 0,
     composer: tuizr.TextInput,
     is_running: bool = false,
     usage: ?events.UsageSnapshot = null,
@@ -122,6 +207,107 @@ fn ensureBlock(state: *State, kind: tuizr.BlockKind) void {
     if (state.current_kind == kind) return;
     tuizr.transcriptStartBlock(&state.transcript, kind);
     state.current_kind = kind;
+}
+
+fn findToolCall(state: *const State, tool_call_id: []const u8) ?usize {
+    const id_hash = std.hash.XxHash64.hash(0, tool_call_id);
+    var offset: usize = 0;
+    while (offset < state.tool_count) : (offset += 1) {
+        const index = (state.tool_head + offset) % max_in_flight_tools;
+        if (state.tool_calls[index].matches(tool_call_id, id_hash)) return index;
+    }
+    return null;
+}
+
+fn startToolBlock(state: *State, tool_name: []const u8) void {
+    tuizr.transcriptStartBlock(&state.transcript, .tool);
+    tuizr.transcriptAppend(&state.transcript, "→ ");
+    tuizr.transcriptAppend(&state.transcript, tool_name);
+    tuizr.transcriptAppend(&state.transcript, "\n");
+    state.current_kind = .tool;
+}
+
+fn appendToolStatus(state: *State, is_error: bool) void {
+    tuizr.transcriptAppend(&state.transcript, "\n");
+    tuizr.transcriptAppend(&state.transcript, if (is_error) "error" else "done");
+}
+
+fn popForegroundTool(state: *State) void {
+    state.tool_head = (state.tool_head + 1) % max_in_flight_tools;
+    state.tool_count -= 1;
+    if (state.tool_count == 0) state.tool_head = 0;
+}
+
+fn finalizeForegroundToolAndPromote(state: *State, is_error: bool) void {
+    appendToolStatus(state, is_error);
+    tuizr.transcriptFinalize(&state.transcript);
+    state.current_kind = null;
+    popForegroundTool(state);
+
+    while (state.tool_count != 0) {
+        const pending = &state.tool_calls[state.tool_head];
+        startToolBlock(state, pending.name());
+        tuizr.transcriptAppend(&state.transcript, pending.bufferedOutput());
+        if (!pending.finished) return;
+
+        appendToolStatus(state, pending.is_error);
+        tuizr.transcriptFinalize(&state.transcript);
+        state.current_kind = null;
+        popForegroundTool(state);
+    }
+}
+
+fn appendOverflowedToolStart(state: *State, tool_name: []const u8) void {
+    if (state.current_kind != .tool) return;
+    tuizr.transcriptAppend(&state.transcript, "\n→ ");
+    tuizr.transcriptAppend(&state.transcript, tool_name);
+    tuizr.transcriptAppend(&state.transcript, "\n");
+}
+
+fn appendOverflowedToolFinish(state: *State, is_error: bool) void {
+    if (state.current_kind != .tool) return;
+    appendToolStatus(state, is_error);
+    tuizr.transcriptAppend(&state.transcript, "\n");
+}
+
+fn toolStarted(state: *State, tool_call_id: []const u8, tool_name: []const u8) void {
+    if (state.tool_count == max_in_flight_tools) {
+        appendOverflowedToolStart(state, tool_name);
+        return;
+    }
+
+    const was_empty = state.tool_count == 0;
+    const index = (state.tool_head + state.tool_count) % max_in_flight_tools;
+    state.tool_calls[index] = InFlightToolCall.init(tool_call_id, tool_name);
+    state.tool_count += 1;
+    if (was_empty) startToolBlock(state, tool_name);
+}
+
+fn toolOutput(state: *State, tool_call_id: []const u8, bytes: []const u8) void {
+    const index = findToolCall(state, tool_call_id) orelse {
+        if (state.current_kind == .tool) {
+            tuizr.transcriptAppend(&state.transcript, bytes);
+        }
+        return;
+    };
+
+    if (index == state.tool_head) {
+        tuizr.transcriptAppend(&state.transcript, bytes);
+    } else {
+        state.tool_calls[index].appendBufferedOutput(bytes);
+    }
+}
+
+fn toolFinished(state: *State, tool_call_id: []const u8, is_error: bool) void {
+    const index = findToolCall(state, tool_call_id) orelse {
+        appendOverflowedToolFinish(state, is_error);
+        return;
+    };
+
+    const call = &state.tool_calls[index];
+    call.finished = true;
+    call.is_error = is_error;
+    if (index == state.tool_head) finalizeForegroundToolAndPromote(state, is_error);
 }
 
 pub fn run(
@@ -242,21 +428,13 @@ fn applyEvent(state: *State, event: events.AgentEvent) void {
             state.current_kind = null;
         },
         .tool_started => |started| {
-            tuizr.transcriptStartBlock(&state.transcript, .tool);
-            tuizr.transcriptAppend(&state.transcript, "→ ");
-            tuizr.transcriptAppend(&state.transcript, started.tool_name);
-            tuizr.transcriptAppend(&state.transcript, "\n");
-            state.current_kind = .tool;
+            toolStarted(state, started.tool_call_id, started.tool_name);
         },
         .tool_output => |output| {
-            // Phase 5 will route interleaved output by tool_call_id.
-            tuizr.transcriptAppend(&state.transcript, output.bytes);
+            toolOutput(state, output.tool_call_id, output.bytes);
         },
         .tool_finished => |finished| {
-            tuizr.transcriptAppend(&state.transcript, "\n");
-            tuizr.transcriptAppend(&state.transcript, if (finished.is_error) "error" else "done");
-            tuizr.transcriptFinalize(&state.transcript);
-            state.current_kind = null;
+            toolFinished(state, finished.tool_call_id, finished.is_error);
         },
         .approval_requested => |request| {
             tuizr.transcriptStartBlock(&state.transcript, .notice);
@@ -572,14 +750,50 @@ fn applyComposedFrameScript(allocator: Allocator, state: *State) !void {
     for (script) |event| applyEvent(state, event);
 }
 
+fn applyToolStartedForTest(
+    allocator: Allocator,
+    state: *State,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+) !void {
+    var started = try events.ToolStarted.init(allocator, tool_call_id, tool_name, "{}");
+    defer started.deinit(allocator);
+    applyEvent(state, .{ .tool_started = started });
+}
+
+fn applyToolOutputForTest(
+    allocator: Allocator,
+    state: *State,
+    tool_call_id: []const u8,
+    bytes: []const u8,
+) !void {
+    var output = try events.ToolOutputDelta.init(allocator, tool_call_id, bytes);
+    defer output.deinit(allocator);
+    applyEvent(state, .{ .tool_output = output });
+}
+
+fn applyToolFinishedForTest(
+    allocator: Allocator,
+    state: *State,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    is_error: bool,
+) !void {
+    var finished = try events.ToolFinished.init(
+        allocator,
+        tool_call_id,
+        tool_name,
+        is_error,
+        null,
+    );
+    defer finished.deinit(allocator);
+    applyEvent(state, .{ .tool_finished = finished });
+}
+
 fn applyToolScript(allocator: Allocator, state: *State) !void {
-    var script = [_]events.AgentEvent{
-        .{ .tool_started = try events.ToolStarted.init(allocator, "t1", "read", "{}") },
-        .{ .tool_output = try events.ToolOutputDelta.init(allocator, "t1", "contents") },
-        .{ .tool_finished = try events.ToolFinished.init(allocator, "t1", "read", false, null) },
-    };
-    defer for (&script) |*event| event.deinit(allocator);
-    for (script) |event| applyEvent(state, event);
+    try applyToolStartedForTest(allocator, state, "t1", "read");
+    try applyToolOutputForTest(allocator, state, "t1", "contents");
+    try applyToolFinishedForTest(allocator, state, "t1", "read", false);
 }
 
 fn transcriptBlockContent(transcript: *const tuizr.Transcript, index: usize) []const u8 {
@@ -845,6 +1059,151 @@ test "tool events render one finalized transcript block with header output and s
     try std.testing.expectEqual(transcript_theme.tool.attrs, output.attrs);
     try expectCellColors(transcript_theme.tool, output);
     try std.testing.expectEqual(@as(?tuizr.BlockKind, null), state.current_kind);
+}
+
+test "interleaved tool output is attributed to sequential transcript blocks" {
+    var state = State.init();
+    try applyToolStartedForTest(std.testing.allocator, &state, "a", "A");
+    try applyToolStartedForTest(std.testing.allocator, &state, "b", "B");
+    try applyToolOutputForTest(std.testing.allocator, &state, "a", "aaa");
+    try applyToolOutputForTest(std.testing.allocator, &state, "b", "bbb");
+    try applyToolOutputForTest(std.testing.allocator, &state, "a", "aaa2");
+    try applyToolFinishedForTest(std.testing.allocator, &state, "a", "A", false);
+    try applyToolFinishedForTest(std.testing.allocator, &state, "b", "B", false);
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.block_count);
+    try std.testing.expectEqualStrings(
+        "→ A\naaaaaa2\ndone",
+        transcriptBlockContent(&state.transcript, 0),
+    );
+    try std.testing.expectEqualStrings(
+        "→ B\nbbb\ndone",
+        transcriptBlockContent(&state.transcript, 1),
+    );
+    try std.testing.expect(state.transcript.blocks[0].finalized);
+    try std.testing.expect(state.transcript.blocks[1].finalized);
+    try std.testing.expectEqual(@as(usize, 0), state.tool_count);
+    try std.testing.expectEqual(@as(?tuizr.BlockKind, null), state.current_kind);
+}
+
+test "pending tool finished before promotion renders and finalizes on promotion" {
+    var state = State.init();
+    try applyToolStartedForTest(std.testing.allocator, &state, "a", "A");
+    try applyToolStartedForTest(std.testing.allocator, &state, "b", "B");
+    try applyToolOutputForTest(std.testing.allocator, &state, "a", "front");
+    try applyToolOutputForTest(std.testing.allocator, &state, "b", "buffered");
+    try applyToolFinishedForTest(std.testing.allocator, &state, "b", "B", true);
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.block_count);
+    try std.testing.expectEqualStrings(
+        "→ A\nfront",
+        transcriptBlockContent(&state.transcript, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 2), state.tool_count);
+
+    try applyToolFinishedForTest(std.testing.allocator, &state, "a", "A", false);
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.block_count);
+    try std.testing.expectEqualStrings(
+        "→ A\nfront\ndone",
+        transcriptBlockContent(&state.transcript, 0),
+    );
+    try std.testing.expectEqualStrings(
+        "→ B\nbuffered\nerror",
+        transcriptBlockContent(&state.transcript, 1),
+    );
+    try std.testing.expect(state.transcript.blocks[1].finalized);
+    try std.testing.expectEqual(@as(usize, 0), state.tool_count);
+    try std.testing.expectEqual(@as(?usize, null), state.transcript.active_index);
+    try std.testing.expectEqual(@as(?tuizr.BlockKind, null), state.current_kind);
+}
+
+test "single tool output streams live before finalization" {
+    var state = State.init();
+    try applyToolStartedForTest(std.testing.allocator, &state, "single", "read");
+    try applyToolOutputForTest(std.testing.allocator, &state, "single", "contents");
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.block_count);
+    try std.testing.expectEqualStrings(
+        "→ read\ncontents",
+        transcriptBlockContent(&state.transcript, 0),
+    );
+    try std.testing.expect(!state.transcript.blocks[0].finalized);
+    try std.testing.expectEqual(@as(?usize, 0), state.transcript.active_index);
+    try std.testing.expectEqual(@as(?tuizr.BlockKind, .tool), state.current_kind);
+
+    try applyToolFinishedForTest(std.testing.allocator, &state, "single", "read", false);
+
+    try std.testing.expectEqualStrings(
+        "→ read\ncontents\ndone",
+        transcriptBlockContent(&state.transcript, 0),
+    );
+    try std.testing.expect(state.transcript.blocks[0].finalized);
+    try std.testing.expectEqual(@as(usize, 0), state.tool_count);
+    try std.testing.expectEqual(@as(?tuizr.BlockKind, null), state.current_kind);
+}
+
+test "pending tool output buffer truncates with a marker" {
+    var state = State.init();
+    try applyToolStartedForTest(std.testing.allocator, &state, "foreground", "A");
+    try applyToolStartedForTest(std.testing.allocator, &state, "buffered", "B");
+
+    var oversized: [max_buffered_tool_output_bytes + 64]u8 = undefined;
+    @memset(&oversized, 'x');
+    try applyToolOutputForTest(std.testing.allocator, &state, "buffered", &oversized);
+    try applyToolFinishedForTest(std.testing.allocator, &state, "foreground", "A", false);
+    try applyToolFinishedForTest(std.testing.allocator, &state, "buffered", "B", false);
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.block_count);
+    const content = transcriptBlockContent(&state.transcript, 1);
+    const header = "→ B\n";
+    try std.testing.expect(std.mem.startsWith(u8, content, header));
+    const buffered_end = header.len + max_buffered_tool_output_bytes;
+    const buffered = content[header.len..buffered_end];
+    try std.testing.expectEqual(
+        @as(usize, max_buffered_tool_output_bytes),
+        buffered.len,
+    );
+    try std.testing.expect(std.mem.allEqual(
+        u8,
+        buffered[0 .. buffered.len - buffered_tool_output_truncation_marker.len],
+        'x',
+    ));
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        buffered,
+        buffered_tool_output_truncation_marker,
+    ));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, buffered, buffered_tool_output_truncation_marker),
+    );
+    try std.testing.expectEqualStrings("\ndone", content[buffered_end..]);
+    try std.testing.expect(state.transcript.blocks[1].finalized);
+    try std.testing.expectEqual(@as(usize, 0), state.tool_count);
+}
+
+test "tool tracking capacity overflow appends best effort to foreground" {
+    var state = State.init();
+    var index: usize = 0;
+    while (index < max_in_flight_tools + 1) : (index += 1) {
+        var id_buffer: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "tool-{d}", .{index});
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "Tool-{d}", .{index});
+        try applyToolStartedForTest(std.testing.allocator, &state, id, name);
+    }
+
+    try applyToolOutputForTest(std.testing.allocator, &state, "tool-8", "overflow-output");
+    try applyToolFinishedForTest(std.testing.allocator, &state, "tool-8", "Tool-8", false);
+
+    try std.testing.expectEqual(@as(usize, max_in_flight_tools), state.tool_count);
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.block_count);
+    const content = transcriptBlockContent(&state.transcript, 0);
+    try std.testing.expect(std.mem.indexOf(u8, content, "→ Tool-8\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "overflow-output") != null);
+    try std.testing.expect(!state.transcript.blocks[0].finalized);
+    try std.testing.expectEqual(@as(?tuizr.BlockKind, .tool), state.current_kind);
 }
 
 test "transcript scroll keys preserve the composer and restore follow-bottom" {
