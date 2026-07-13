@@ -1,6 +1,6 @@
 # Roadmap
 
-**Status (2026-07-12):** research phase complete (`docs/research/`, nine
+**Status (2026-07-13):** research phase complete (`docs/research/`, nine
 reports); porting guide and contracts drafted; **Phase 0 complete**
 (deps wired, skeleton, three dependency smokes); **Phase 0b complete**
 (hashline engine, 222/222 upstream corpus cases, adversarial review
@@ -10,8 +10,16 @@ session entries, catalog, truncation core, approval table, events),
 1b the loop (scheduler, mailboxes, raise/lower round-trip, AgentSession,
 retry ladder), 1c the four essential tools (read, bash, edit, write) on
 the tool.zig seam with an end-to-end read→snapshot→edit integration test.
-Every subsystem multi-reviewed against upstream; 461/461 tests.
-**Next: Phase 2 — print/JSON modes + JSONL session persistence.**
+**Phase 2 COMPLETE** — the core is provably frontend-agnostic and durable:
+2a the session JSONL store (dir-encoded paths, title slot, entry tree +
+mutable leaf, deferred/atomic persistence, truncation + blob store, lenient
+load + v1→v3 migrations, resume) plus the gated `-Dlive` Anthropic smoke;
+2b the CLI slice, JSON settings + precedence + defaults, key resolution +
+provider construction, and print/JSON modes as pure `AgentEvent` consumers
+with byte-exact goldens. Every subsystem multi-reviewed against upstream and
+adversarially audited; 516/517 tests (1 gated live), green across seeds.
+**Next: Phase 3 — ZigZag TUI core. Prerequisite: pin the zigzag fork with
+the `ctrl_c` forward option before the TUI lands.**
 
 Phased implementation plan. Ordering is forced by the upstream dependency
 spine (hashline → catalog → agent core → tools → session → modes → TUI →
