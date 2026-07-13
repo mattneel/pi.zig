@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .@"default-openrouter" = false,
     });
-    const zigzag_dep = b.dependency("zigzag", .{
+    const tuizr_dep = b.dependency("tuizr", .{
         .target = target,
         .optimize = optimize,
     });
@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
         .google = ai_dep.module("google"),
         .xai = ai_dep.module("xai"),
         .mcp = ai_dep.module("mcp"),
-        .zigzag = zigzag_dep.module("zigzag"),
+        .tuizr = tuizr_dep.module("tuizr"),
         .quickjs = quickjs_dep.module("quickjs"),
     };
     const quickjs_lib = quickjs_dep.artifact("quickjs-ng");
@@ -120,7 +120,7 @@ const Dependencies = struct {
     google: *std.Build.Module,
     xai: *std.Build.Module,
     mcp: *std.Build.Module,
-    zigzag: *std.Build.Module,
+    tuizr: *std.Build.Module,
     quickjs: *std.Build.Module,
 };
 
@@ -135,6 +135,6 @@ fn addDependencyImports(module: *std.Build.Module, deps: Dependencies) void {
     module.addImport("google", deps.google);
     module.addImport("xai", deps.xai);
     module.addImport("mcp", deps.mcp);
-    module.addImport("zigzag", deps.zigzag);
+    module.addImport("tuizr", deps.tuizr);
     module.addImport("quickjs", deps.quickjs);
 }

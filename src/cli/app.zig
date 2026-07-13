@@ -1,4 +1,4 @@
-//! Phase-2 CLI startup and non-interactive mode wiring.
+//! CLI startup and frontend wiring.
 
 const std = @import("std");
 const agent = @import("../core/agent.zig");
@@ -138,12 +138,6 @@ fn runParsed(
     options: RunOptions,
 ) !u8 {
     const is_print = parsed.print or parsed.mode != null or !stdin_is_tty;
-    if (!is_print) {
-        try stderr.writeAll("interactive mode arrives in phase 3; pass -p or pipe a prompt\n");
-        try stderr.flush();
-        return @intFromEnum(ExitCode.success);
-    }
-
     const resolved_cwd = resolveCwdAlloc(allocator, io, parsed.cwd) catch |err|
         return failError(stderr, "Unable to resolve --cwd", err);
     defer allocator.free(resolved_cwd);
@@ -323,11 +317,20 @@ fn runParsed(
     }) catch |err| return failError(stderr, "Unable to initialize agent session", err);
     defer session.deinit();
 
-    const mode: modes.Mode = if (parsed.mode == .json) .json else .text;
-    return modes.run(allocator, io, &session, stdout, stderr, .{
-        .mode = mode,
-        .prompts = prompt_list.prompts,
-    }) catch |err| return failError(stderr, "Non-interactive mode failed", err);
+    if (is_print) {
+        const mode: modes.Mode = if (parsed.mode == .json) .json else .text;
+        return modes.run(allocator, io, &session, stdout, stderr, .{
+            .mode = mode,
+            .prompts = prompt_list.prompts,
+        }) catch |err| return failError(stderr, "Non-interactive mode failed", err);
+    }
+    return @import("../tui/tui.zig").run(
+        allocator,
+        io,
+        &session,
+        prompt_list.prompts,
+        stderr,
+    ) catch |err| return failError(stderr, "Interactive mode failed", err);
 }
 
 const PromptList = struct {
@@ -565,7 +568,7 @@ test "CLI exit-code matrix covers success failure and unknown flags" {
 
     stdout.clearRetainingCapacity();
     stderr.clearRetainingCapacity();
-    try std.testing.expectEqual(@as(u8, 0), try runWithInput(
+    try std.testing.expectEqual(@as(u8, 1), try runWithInput(
         allocator,
         io,
         &.{},
@@ -576,7 +579,7 @@ test "CLI exit-code matrix covers success failure and unknown flags" {
         run_options,
     ));
     try std.testing.expectEqualStrings(
-        "interactive mode arrives in phase 3; pass -p or pipe a prompt\n",
+        "No model configured. Pass --model <provider/id> or set modelRoles.default.\n",
         stderr.written(),
     );
 

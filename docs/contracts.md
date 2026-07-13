@@ -112,15 +112,26 @@ prefixes and selector errors; grep `*LINE:` format; truncation notices
 `(no output)` / `Command exited with code <n>`; tool-skip text
 (`Skipped due to queued user message…`); soft-tool-choice reminder text.
 
-## TUI threading `[planned]`
+## TUI threading `[verified]`
 
-- `Program.send` is UI-thread-only; the agent publishes owned events into
-  a bounded mailbox drained by the UI loop before each `tick()`.
+- The interactive task owns the tuizr `Terminal`, polls input, writes the
+  back-buffer cells, and calls `render()`; the agent task touches only the two
+  mailboxes.
+- The agent publishes owned events into a bounded mailbox drained by the UI
+  loop before each frame. No additional frontend channel is used.
 - Event payloads are deep-copied at the core boundary; no ai.zig stream
   slices or session-arena pointers ever enter a mailbox.
-- Frame-arena allocations (`ctx.allocator`) never outlive a tick;
-  transcript blocks/caches live on the persistent TUI allocator; blocks
-  are immutable once finalized.
+- The Phase 3a transcript and composer compose tuizr `StreamingView` and
+  `TextInput`; `StreamingView` copies event bytes before each owned event is
+  released. Rich transcript and editor behavior remains in tuizr's later
+  widget phases.
+- Key release events do not trigger actions. Escape sends user cancellation;
+  one Ctrl+C clears the composer and a second within 500 ms quits; Ctrl+D
+  quits. Normal exit sends shutdown, awaits the agent task, synchronizes the
+  session, restores the terminal, and prints the persistent-session resume
+  hint.
+- Approval requests are auto-approved with a transcript notice until the
+  interactive approval UI lands in Phase 5.
 - Tool output has three representations: canonical (session/artifact),
   TUI-live (bounded ring), model-visible (Pi truncation policy).
 
@@ -139,12 +150,11 @@ parent `task` approval boundary.
 - **[open]** Session-file interop guarantee level with upstream omp
   (read-compatible? bidirectional?) — currently: same format, separate
   root (`~/.omp-zig/`), no cohabitation claim.
-- **[decided]** Ctrl+C keybinding: no ZigZag fork. Escape cancels the
-  running turn; Ctrl+C keeps ZigZag's default quit (clean — post-loop
-  shutdown flushes and prints the resume hint). The `ctrl_c` forward option
-  is deferred to an optional upstream contribution (ledger L68).
-- **[open]** ZigZag `post`/wake thread-safe mailbox: upstream contribution
-  vs mailbox-drain-before-tick at 60 fps.
+- **[decided]** tuizr forwards Ctrl+C to the application. The interactive
+  frontend implements the editor-clear/double-press-quit ladder directly.
+- **[open]** tuizr currently reports Ctrl+D as a character codepoint with the
+  Ctrl modifier rather than a dedicated `.d` key; the Phase 3a handler accepts
+  that representation, with extended named-key parsing deferred to Phase 3c.
 - **[open]** Windows support tier (ConPTY bash, suspend semantics).
 - **[open]** Duplicate tool-call ids within one response (inherits
   ai.zig's last-write-wins; needs a defined contract + test here too).
