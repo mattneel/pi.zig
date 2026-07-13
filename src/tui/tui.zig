@@ -11,6 +11,79 @@ const testkit = @import("../testkit/mock_transport.zig");
 const Allocator = std.mem.Allocator;
 const double_ctrl_c_ms: i64 = 500;
 
+const transcript_theme: tuizr.TranscriptTheme = .{
+    .markdown = .{
+        .text = .{
+            .fg = .{ .r = 224, .g = 228, .b = 238 },
+            .bg = .{ .r = 0, .g = 0, .b = 0 },
+        },
+        .heading = .{
+            .fg = .{ .r = 150, .g = 205, .b = 255 },
+            .bg = .{ .r = 0, .g = 0, .b = 0 },
+            .attrs = tuizr.Attr.bold,
+        },
+        .code = .{
+            .fg = .{ .r = 232, .g = 235, .b = 242 },
+            .bg = .{ .r = 30, .g = 35, .b = 46 },
+        },
+        .code_bg = .{
+            .fg = .{ .r = 232, .g = 235, .b = 242 },
+            .bg = .{ .r = 20, .g = 24, .b = 34 },
+        },
+        .quote = .{
+            .fg = .{ .r = 175, .g = 184, .b = 200 },
+            .bg = .{ .r = 0, .g = 0, .b = 0 },
+            .attrs = tuizr.Attr.dim,
+        },
+        .bullet = .{
+            .fg = .{ .r = 115, .g = 195, .b = 255 },
+            .bg = .{ .r = 0, .g = 0, .b = 0 },
+        },
+        .link = .{
+            .fg = .{ .r = 110, .g = 185, .b = 255 },
+            .bg = .{ .r = 0, .g = 0, .b = 0 },
+            .attrs = tuizr.Attr.underline,
+        },
+    },
+    .user = .{
+        .fg = .{ .r = 160, .g = 215, .b = 255 },
+        .bg = .{ .r = 15, .g = 27, .b = 42 },
+    },
+    .reasoning = .{
+        .fg = .{ .r = 160, .g = 170, .b = 188 },
+        .bg = .{ .r = 0, .g = 0, .b = 0 },
+        .attrs = tuizr.Attr.dim,
+    },
+    .tool = .{
+        .fg = .{ .r = 170, .g = 225, .b = 190 },
+        .bg = .{ .r = 16, .g = 30, .b = 26 },
+    },
+    .@"error" = .{
+        .fg = .{ .r = 245, .g = 145, .b = 145 },
+        .bg = .{ .r = 0, .g = 0, .b = 0 },
+    },
+    .notice = .{
+        .fg = .{ .r = 185, .g = 194, .b = 210 },
+        .bg = .{ .r = 0, .g = 0, .b = 0 },
+        .attrs = tuizr.Attr.dim,
+    },
+    .separator = .{
+        .fg = .{ .r = 105, .g = 115, .b = 130 },
+        .bg = .{ .r = 0, .g = 0, .b = 0 },
+        .attrs = tuizr.Attr.dim,
+    },
+};
+
+const composer_style: tuizr.widgets.Style = .{
+    .fg = .{ .r = 232, .g = 236, .b = 248 },
+    .bg = .{ .r = 38, .g = 46, .b = 64 },
+};
+
+const status_style: tuizr.widgets.Style = .{
+    .fg = .{ .r = 210, .g = 215, .b = 230 },
+    .bg = .{ .r = 24, .g = 30, .b = 44 },
+};
+
 const Clock = union(enum) {
     io: std.Io,
     fixed_ms: *const i64,
@@ -24,116 +97,23 @@ const Clock = union(enum) {
 };
 
 const State = struct {
-    transcript: tuizr.StreamingView = .{},
+    transcript: tuizr.Transcript = .{},
+    current_kind: ?tuizr.BlockKind = null,
     composer: tuizr.TextInput,
     is_running: bool = false,
     quit_requested: bool = false,
     last_ctrl_c_ms: ?i64 = null,
-    transcript_width: u16,
-    transcript_height: u16,
-    assistant_id: [128]u8 = undefined,
-    assistant_id_len: usize = 0,
-    assistant_has_delta: bool = false,
-    stream_line: enum { none, assistant, reasoning } = .none,
 
-    fn init(width: u16, height: u16) State {
-        return .{
-            .composer = tuizr.TextInput.init(),
-            .transcript_width = width,
-            .transcript_height = height,
-        };
-    }
-
-    fn setTranscriptViewport(self: *State, width: u16, height: u16) void {
-        self.transcript_width = width;
-        self.transcript_height = height;
-        if (self.transcript.auto_scroll) {
-            tuizr.streamingViewScrollToBottom(&self.transcript, width, height);
-        }
-    }
-
-    fn append(self: *State, text: []const u8) void {
-        tuizr.streamingViewAppend(
-            &self.transcript,
-            text,
-            self.transcript_width,
-            self.transcript_height,
-        );
-    }
-
-    fn ensureLineStart(self: *State) void {
-        if (self.transcript.len != 0 and self.transcript.buffer[self.transcript.len - 1] != '\n') {
-            self.append("\n");
-        }
-    }
-
-    fn appendLine(self: *State, prefix: []const u8, text: []const u8) void {
-        self.ensureLineStart();
-        self.append(prefix);
-        self.append(text);
-        self.append("\n");
-        self.stream_line = .none;
-    }
-
-    fn appendPrompt(self: *State, text: []const u8) void {
-        self.appendLine("user: ", text);
-    }
-
-    fn startAssistant(self: *State, id: []const u8) void {
-        self.ensureLineStart();
-        self.assistant_id_len = @min(id.len, self.assistant_id.len);
-        @memcpy(self.assistant_id[0..self.assistant_id_len], id[0..self.assistant_id_len]);
-        self.assistant_has_delta = false;
-        self.stream_line = .none;
-    }
-
-    fn assistantMatches(self: *const State, id: []const u8) bool {
-        return self.assistant_id_len == id.len and
-            std.mem.eql(u8, self.assistant_id[0..self.assistant_id_len], id);
-    }
-
-    fn startAssistantLine(self: *State) void {
-        if (self.stream_line == .assistant) return;
-        self.ensureLineStart();
-        self.append("assistant: ");
-        self.stream_line = .assistant;
-    }
-
-    fn appendAssistantDelta(self: *State, delta: events.TextDelta) void {
-        if (self.assistantMatches(delta.message_id)) {
-            self.startAssistantLine();
-            self.assistant_has_delta = true;
-        }
-        self.append(delta.text);
-    }
-
-    fn appendReasoningDelta(self: *State, delta: events.ReasoningDelta) void {
-        if (self.stream_line != .reasoning) {
-            self.ensureLineStart();
-            self.append("thinking: ");
-            self.stream_line = .reasoning;
-        }
-        self.append(delta.text);
-    }
-
-    fn finishAssistant(self: *State, finished: events.MessageFinished) void {
-        if (!self.assistantMatches(finished.id)) return;
-        if (!self.assistant_has_delta) {
-            self.startAssistantLine();
-            for (finished.text_blocks, 0..) |block, index| {
-                if (index != 0) self.append("\n");
-                self.append(block);
-            }
-            if (finished.text_blocks.len == 0) {
-                if (finished.error_message) |message| self.append(message);
-            }
-        }
-        self.ensureLineStart();
-        self.assistant_id_len = 0;
-        self.assistant_has_delta = false;
-        self.stream_line = .none;
+    fn init() State {
+        return .{ .composer = tuizr.TextInput.init() };
     }
 };
+
+fn ensureBlock(state: *State, kind: tuizr.BlockKind) void {
+    if (state.current_kind == kind) return;
+    tuizr.transcriptStartBlock(&state.transcript, kind);
+    state.current_kind = kind;
+}
 
 pub fn run(
     gpa: Allocator,
@@ -153,20 +133,20 @@ pub fn run(
     var terminal_live = true;
     defer if (terminal_live) term.deinit();
 
-    const grid = term.backBuffer();
     const state = try gpa.create(State);
     defer gpa.destroy(state);
-    state.* = State.init(grid.width(), grid.height() -| 2);
+    state.* = State.init();
 
     for (initial_prompts) |text| {
         try pushPrompt(gpa, io, session, text);
-        state.appendPrompt(text);
+        tuizr.transcriptStartBlock(&state.transcript, .user);
+        tuizr.transcriptAppend(&state.transcript, text);
+        tuizr.transcriptFinalize(&state.transcript);
+        state.current_kind = null;
     }
 
     const clock: Clock = .{ .io = io };
     while (!state.quit_requested) {
-        state.setTranscriptViewport(term.backBuffer().width(), term.backBuffer().height() -| 2);
-
         while (session.outbox().tryPop(io)) |owned_event| {
             var event = owned_event;
             defer event.deinit(gpa);
@@ -228,22 +208,57 @@ fn applyEvent(state: *State, event: events.AgentEvent) void {
         .run_started => state.is_running = true,
         .run_finished => state.is_running = false,
         .message_started => |started| if (started.role == .assistant) {
-            state.startAssistant(started.id);
+            state.current_kind = null;
         },
-        .text_delta => |delta| state.appendAssistantDelta(delta),
-        .reasoning_delta => |delta| state.appendReasoningDelta(delta),
-        .message_finished => |finished| state.finishAssistant(finished),
-        .tool_started => |started| state.appendLine("→ ", started.tool_name),
-        .tool_finished => |finished| state.appendLine("  ", if (finished.is_error) "error" else "done"),
+        .reasoning_delta => |delta| {
+            ensureBlock(state, .reasoning);
+            tuizr.transcriptAppend(&state.transcript, delta.text);
+        },
+        .text_delta => |delta| {
+            ensureBlock(state, .assistant);
+            tuizr.transcriptAppend(&state.transcript, delta.text);
+        },
+        .message_finished => {
+            tuizr.transcriptFinalize(&state.transcript);
+            state.current_kind = null;
+        },
+        .tool_started => |started| {
+            tuizr.transcriptStartBlock(&state.transcript, .tool);
+            tuizr.transcriptAppend(&state.transcript, "→ ");
+            tuizr.transcriptAppend(&state.transcript, started.tool_name);
+            tuizr.transcriptAppend(&state.transcript, "\n");
+            state.current_kind = .tool;
+        },
+        .tool_output => |output| {
+            // Phase 5 will route interleaved output by tool_call_id.
+            tuizr.transcriptAppend(&state.transcript, output.bytes);
+        },
+        .tool_finished => |finished| {
+            tuizr.transcriptAppend(&state.transcript, "\n");
+            tuizr.transcriptAppend(&state.transcript, if (finished.is_error) "error" else "done");
+            tuizr.transcriptFinalize(&state.transcript);
+            state.current_kind = null;
+        },
         .approval_requested => |request| {
-            state.ensureLineStart();
-            state.append("auto-approved ");
-            state.append(request.tool_name);
-            state.append(" (approval UI arrives in Phase 5)\n");
-            state.stream_line = .none;
+            tuizr.transcriptStartBlock(&state.transcript, .notice);
+            tuizr.transcriptAppend(&state.transcript, "auto-approved ");
+            tuizr.transcriptAppend(&state.transcript, request.tool_name);
+            tuizr.transcriptAppend(&state.transcript, " (approval UI arrives in Phase 5)");
+            tuizr.transcriptFinalize(&state.transcript);
+            state.current_kind = null;
         },
-        .notice => |notice| state.appendLine("notice: ", notice.message),
-        .failed => |failure| state.appendLine("error: ", failure.message),
+        .failed => |failure| {
+            tuizr.transcriptStartBlock(&state.transcript, .@"error");
+            tuizr.transcriptAppend(&state.transcript, failure.message);
+            tuizr.transcriptFinalize(&state.transcript);
+            state.current_kind = null;
+        },
+        .notice => |notice| {
+            tuizr.transcriptStartBlock(&state.transcript, .notice);
+            tuizr.transcriptAppend(&state.transcript, notice.message);
+            tuizr.transcriptFinalize(&state.transcript);
+            state.current_kind = null;
+        },
         else => {},
     }
 }
@@ -288,7 +303,10 @@ fn handleKey(
         if (tuizr.textInputHandleKey(&state.composer, key_event)) |submitted| {
             if (submitted.len != 0) {
                 try pushPrompt(gpa, io, session, submitted);
-                state.appendPrompt(submitted);
+                tuizr.transcriptStartBlock(&state.transcript, .user);
+                tuizr.transcriptAppend(&state.transcript, submitted);
+                tuizr.transcriptFinalize(&state.transcript);
+                state.current_kind = null;
             }
         }
         return;
@@ -325,13 +343,12 @@ fn draw(state: *State, grid: *tuizr.CellGrid) void {
     if (height == 0) return;
 
     const transcript_height = height -| 2;
-    state.setTranscriptViewport(width, transcript_height);
     if (transcript_height != 0) {
-        tuizr.drawStreamingView(
+        tuizr.drawTranscript(
             grid,
             .{ .x = 0, .y = 0, .w = width, .h = transcript_height },
             &state.transcript,
-            .{},
+            transcript_theme,
         );
     }
 
@@ -340,7 +357,7 @@ fn draw(state: *State, grid: *tuizr.CellGrid) void {
         grid,
         .{ .x = 0, .y = composer_y, .w = width, .h = 1 },
         &state.composer,
-        .{ .bg = .{ .r = 18, .g = 22, .b = 30 } },
+        composer_style,
         true,
     );
 
@@ -354,11 +371,7 @@ fn draw(state: *State, grid: *tuizr.CellGrid) void {
             grid,
             .{ .x = 0, .y = height - 1, .w = width, .h = 1 },
             &status_view,
-            .{
-                .fg = .{ .r = 170, .g = 178, .b = 196 },
-                .bg = .{ .r = 10, .g = 12, .b = 18 },
-                .attrs = tuizr.Attr.dim,
-            },
+            status_style,
         );
     }
 }
@@ -380,12 +393,29 @@ fn keyCtrlC(event_type: tuizr.EventType) tuizr.KeyEvent {
     };
 }
 
-fn applyAssistantScript(allocator: Allocator, state: *State) !void {
+fn applyConsecutiveAssistantScript(allocator: Allocator, state: *State) !void {
     var script = [_]events.AgentEvent{
-        .run_started,
         .{ .message_started = try events.MessageStarted.init(allocator, "a1", .assistant) },
         .{ .text_delta = try events.TextDelta.init(allocator, "a1", "Hel") },
         .{ .text_delta = try events.TextDelta.init(allocator, "a1", "lo") },
+        .{ .message_finished = try events.MessageFinished.init(
+            allocator,
+            "a1",
+            .stop,
+            &.{"Hello"},
+            null,
+        ) },
+    };
+    defer for (&script) |*event| event.deinit(allocator);
+    for (script) |event| applyEvent(state, event);
+}
+
+fn applyComposedFrameScript(allocator: Allocator, state: *State) !void {
+    var script = [_]events.AgentEvent{
+        .run_started,
+        .{ .message_started = try events.MessageStarted.init(allocator, "a1", .assistant) },
+        .{ .reasoning_delta = try events.ReasoningDelta.init(allocator, "a1", "pondering") },
+        .{ .text_delta = try events.TextDelta.init(allocator, "a1", "Hello") },
         .{ .message_finished = try events.MessageFinished.init(
             allocator,
             "a1",
@@ -399,24 +429,28 @@ fn applyAssistantScript(allocator: Allocator, state: *State) !void {
     for (script) |event| applyEvent(state, event);
 }
 
-fn applyActivityScript(allocator: Allocator, state: *State) !void {
+fn applyToolScript(allocator: Allocator, state: *State) !void {
     var script = [_]events.AgentEvent{
-        .run_started,
-        .{ .message_started = try events.MessageStarted.init(allocator, "a1", .assistant) },
-        .{ .reasoning_delta = try events.ReasoningDelta.init(allocator, "a1", "pondering") },
         .{ .tool_started = try events.ToolStarted.init(allocator, "t1", "read", "{}") },
+        .{ .tool_output = try events.ToolOutputDelta.init(allocator, "t1", "contents") },
         .{ .tool_finished = try events.ToolFinished.init(allocator, "t1", "read", false, null) },
-        .{ .text_delta = try events.TextDelta.init(allocator, "a1", "Hi") },
-        .{ .message_finished = try events.MessageFinished.init(
-            allocator,
-            "a1",
-            .stop,
-            &.{"Hi"},
-            null,
-        ) },
     };
     defer for (&script) |*event| event.deinit(allocator);
     for (script) |event| applyEvent(state, event);
+}
+
+fn transcriptBlockContent(transcript: *const tuizr.Transcript, index: usize) []const u8 {
+    const block = transcript.blocks[index];
+    return transcript.buffer[block.start .. block.start + block.len];
+}
+
+fn expectCellColors(expected: tuizr.widgets.Style, actual: tuizr.Cell) !void {
+    try std.testing.expectEqual(expected.fg.r, actual.fg_r);
+    try std.testing.expectEqual(expected.fg.g, actual.fg_g);
+    try std.testing.expectEqual(expected.fg.b, actual.fg_b);
+    try std.testing.expectEqual(expected.bg.r, actual.bg_r);
+    try std.testing.expectEqual(expected.bg.g, actual.bg_g);
+    try std.testing.expectEqual(expected.bg.b, actual.bg_b);
 }
 
 fn gridProjectionAlloc(allocator: Allocator, grid: *const tuizr.CellGrid) ![]u8 {
@@ -492,20 +526,22 @@ const TestSession = struct {
     }
 };
 
-test "agent events append streamed assistant text to the transcript" {
-    var state = State.init(40, 4);
-    try applyAssistantScript(std.testing.allocator, &state);
+test "consecutive assistant deltas append to one transcript block" {
+    var state = State.init();
+    try applyConsecutiveAssistantScript(std.testing.allocator, &state);
 
-    try std.testing.expectEqualStrings(
-        "assistant: Hello\n",
-        state.transcript.buffer[0..state.transcript.len],
-    );
-    try std.testing.expect(!state.is_running);
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.block_count);
+    const block = state.transcript.blocks[0];
+    try std.testing.expectEqual(tuizr.BlockKind.assistant, block.kind);
+    try std.testing.expect(block.finalized);
+    try std.testing.expectEqualStrings("Hello", transcriptBlockContent(&state.transcript, 0));
+    try std.testing.expectEqual(@as(?usize, null), state.transcript.active_index);
+    try std.testing.expectEqual(@as(?tuizr.BlockKind, null), state.current_kind);
 }
 
-test "composed frame matches the CellGrid text projection" {
-    var state = State.init(64, 4);
-    try applyAssistantScript(std.testing.allocator, &state);
+test "composed reasoning and assistant frame matches the CellGrid projection and styles" {
+    var state = State.init();
+    try applyComposedFrameScript(std.testing.allocator, &state);
     var grid = try tuizr.CellGrid.init(std.testing.allocator, 64, 6);
     defer grid.deinit();
 
@@ -513,35 +549,59 @@ test "composed frame matches the CellGrid text projection" {
     const projection = try gridProjectionAlloc(std.testing.allocator, &grid);
     defer std.testing.allocator.free(projection);
     try std.testing.expectEqualStrings(
-        "assistant: Hello\n\n\n\n\n" ++
+        "pondering\n\nHello\n\n\n" ++
             "ready | esc cancel | ctrl+c clear/quit | ctrl+d quit\n",
         projection,
     );
+
+    const reasoning = grid.getCell(0, 0) orelse return error.TestUnexpectedResult;
+    const assistant = grid.getCell(0, 2) orelse return error.TestUnexpectedResult;
+    const composer = grid.getCell(0, 4) orelse return error.TestUnexpectedResult;
+    const status = grid.getCell(0, 5) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(transcript_theme.reasoning.attrs, reasoning.attrs);
+    try expectCellColors(transcript_theme.reasoning, reasoning);
+    try std.testing.expectEqual(transcript_theme.markdown.text.attrs, assistant.attrs);
+    try expectCellColors(transcript_theme.markdown.text, assistant);
+    try std.testing.expectEqual(composer_style.attrs | tuizr.Attr.reverse, composer.attrs);
+    try expectCellColors(composer_style, composer);
+    try std.testing.expectEqual(status_style.attrs, status.attrs);
+    try expectCellColors(status_style, status);
+    try std.testing.expect(!state.is_running);
 }
 
-test "reasoning and tool activity precede the streamed reply in the CellGrid projection" {
-    var state = State.init(64, 6);
-    try applyActivityScript(std.testing.allocator, &state);
-    var grid = try tuizr.CellGrid.init(std.testing.allocator, 64, 8);
+test "tool events render one finalized transcript block with header output and status" {
+    var state = State.init();
+    try applyToolScript(std.testing.allocator, &state);
+    var grid = try tuizr.CellGrid.init(std.testing.allocator, 64, 6);
     defer grid.deinit();
 
     draw(&state, &grid);
     const projection = try gridProjectionAlloc(std.testing.allocator, &grid);
     defer std.testing.allocator.free(projection);
     try std.testing.expectEqualStrings(
-        "thinking: pondering\n" ++
-            "→ read\n" ++
-            "  done\n" ++
-            "assistant: Hi\n\n\n\n" ++
-            "running | esc cancel | ctrl+c clear/quit | ctrl+d quit\n",
+        "→ read\ncontents\ndone\n\n\n" ++
+            "ready | esc cancel | ctrl+c clear/quit | ctrl+d quit\n",
         projection,
     );
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.block_count);
+    const block = state.transcript.blocks[0];
+    try std.testing.expectEqual(tuizr.BlockKind.tool, block.kind);
+    try std.testing.expect(block.finalized);
+    try std.testing.expectEqualStrings("→ read\ncontents\ndone", transcriptBlockContent(&state.transcript, 0));
+    const header = grid.getCell(0, 0) orelse return error.TestUnexpectedResult;
+    const output = grid.getCell(0, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(transcript_theme.tool.attrs | tuizr.Attr.bold, header.attrs);
+    try expectCellColors(transcript_theme.tool, header);
+    try std.testing.expectEqual(transcript_theme.tool.attrs, output.attrs);
+    try expectCellColors(transcript_theme.tool, output);
+    try std.testing.expectEqual(@as(?tuizr.BlockKind, null), state.current_kind);
 }
 
 test "text input submission pushes one prompt and clears the composer" {
     const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
     defer fixture.deinit();
-    var state = State.init(40, 4);
+    var state = State.init();
     var now_ms: i64 = 0;
     const clock: Clock = .{ .fixed_ms = &now_ms };
 
@@ -556,12 +616,16 @@ test "text input submission pushes one prompt and clears the composer" {
     try std.testing.expectEqualStrings("hi", command.prompt.text);
     try std.testing.expect(fixture.session.inbox().tryPop(std.testing.io) == null);
     try std.testing.expectEqual(@as(usize, 0), state.composer.len);
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.block_count);
+    try std.testing.expectEqual(tuizr.BlockKind.user, state.transcript.blocks[0].kind);
+    try std.testing.expect(state.transcript.blocks[0].finalized);
+    try std.testing.expectEqualStrings("hi", transcriptBlockContent(&state.transcript, 0));
 }
 
 test "escape pushes user cancellation" {
     const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
     defer fixture.deinit();
-    var state = State.init(40, 4);
+    var state = State.init();
     var now_ms: i64 = 0;
     const clock: Clock = .{ .fixed_ms = &now_ms };
 
@@ -580,7 +644,7 @@ test "Ctrl+C clears once and quits only on a second press within 500ms" {
     defer fixture.deinit();
     var now_ms: i64 = 1_000;
     const clock: Clock = .{ .fixed_ms = &now_ms };
-    var state = State.init(40, 4);
+    var state = State.init();
 
     try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &state, clock, keyCharacter('x'));
     try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &state, clock, keyCtrlC(.release));
@@ -593,7 +657,7 @@ test "Ctrl+C clears once and quits only on a second press within 500ms" {
     try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &state, clock, keyCtrlC(.press));
     try std.testing.expect(state.quit_requested);
 
-    var late_state = State.init(40, 4);
+    var late_state = State.init();
     now_ms = 2_000;
     try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &late_state, clock, keyCharacter('a'));
     try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &late_state, clock, keyCtrlC(.press));
@@ -609,7 +673,7 @@ test "raw Ctrl+C clears once and quits only on a second press within 500ms" {
     defer fixture.deinit();
     var now_ms: i64 = 1_000;
     const clock: Clock = .{ .fixed_ms = &now_ms };
-    var state = State.init(40, 4);
+    var state = State.init();
     const raw_ctrl_c = tuizr.KeyEvent{ .key = .character, .codepoint = 3 };
 
     try handleKey(std.testing.allocator, std.testing.io, &fixture.session, &state, clock, keyCharacter('x'));
@@ -625,7 +689,7 @@ test "raw Ctrl+C clears once and quits only on a second press within 500ms" {
 test "Ctrl+D codepoint requests a normal quit" {
     const fixture = try TestSession.create(std.testing.allocator, std.testing.io);
     defer fixture.deinit();
-    var state = State.init(40, 4);
+    var state = State.init();
     var now_ms: i64 = 0;
     const clock: Clock = .{ .fixed_ms = &now_ms };
     const ctrl_d = tuizr.KeyEvent{
