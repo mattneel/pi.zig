@@ -29,17 +29,12 @@ jobs:
             arch: arm64
           - os: macos-latest
             arch: arm64
-          # macos-15-intel is absent: setup-anyzig has no macOS-X64 case, so
-          # the install step fails there. Upstream anyzig does publish
-          # anyzig-x86_64-macos.tar.gz, so this is a gap in the action rather
-          # than a real platform limit. The cross job below still proves
-          # x86_64-macos builds, and release artifacts for it are produced by
-          # cross-compiling from Linux.
-          #
-          # Windows is absent for a harder reason: tuizr's Terminal is
-          # POSIX-only. `output_fd: std.posix.fd_t = std.posix.STDOUT_FILENO`
-          # does not compile for windows targets, where fd_t is a *anyopaque
-          # HANDLE rather than an integer, and platform/linux.zig is imported
+          - os: macos-15-intel
+            arch: x86_64
+          # Windows is absent because tuizr's Terminal is POSIX-only:
+          # `output_fd: std.posix.fd_t = std.posix.STDOUT_FILENO` does not
+          # compile for windows targets, where fd_t is a *anyopaque HANDLE
+          # rather than an integer, and platform/linux.zig is imported
           # unconditionally. Windows needs a console backend in tuizr first.
 
     steps:
