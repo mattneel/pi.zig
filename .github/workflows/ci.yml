@@ -53,16 +53,31 @@ jobs:
         with:
           cache-key: ${{ matrix.arch }}
 
+      # setup-anyzig caches only the compiler downloads and the global package
+      # cache. Compiled objects live in the project-local .zig-cache, and
+      # without this every run recompiles from scratch: a cold `zig build test`
+      # spends ~21s compiling pi-tests versus ~33ms when cached, and the test
+      # binary is a separate compilation from the executable, so nothing the
+      # build step produces helps it.
+      - name: Cache compiled objects
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          restore-keys: |
+            zig-cache-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig', 'build.zig.zon') }}-
+            zig-cache-test-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Toolchain info
         run: |
           zig any version
           zig version
 
+      # This also links the executable's modules natively, so a separate
+      # `zig build` step here would duplicate the cross job for no extra
+      # coverage.
       - name: Run tests
         run: zig build test --summary all
-
-      - name: Build executable
-        run: zig build --summary all
 
   fmt:
     name: Formatting
@@ -100,6 +115,15 @@ jobs:
         uses: mattneel/setup-anyzig@v1
         with:
           cache-key: ${{ matrix.target }}
+
+      - name: Cache compiled objects
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-cross-${{ matrix.target }}-${{ hashFiles('build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          restore-keys: |
+            zig-cache-cross-${{ matrix.target }}-${{ hashFiles('build.zig', 'build.zig.zon') }}-
+            zig-cache-cross-${{ matrix.target }}-
 
       # Guards the release target set: every artifact release.yml ships must
       # keep cross-compiling from Linux.
