@@ -32,7 +32,10 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .tuizr = .{ .path = "../../tuizr" },
+        .tuizr = .{
+            .url = "git+https://github.com/mattneel/tuizr.git#dbb01592b64b85cd94de6bb2ac59893c691aaf3b",
+            .hash = "tuizr-0.0.0-sJE7hu-VBgCg4v9xcNTemKf0foat8ifqHm4NIB9FoY5x",
+        },
         .ai = .{
             .url = "git+https://github.com/mattneel/ai.zig.git#128433aaa1e453d0dcbcc425537dfdb0c708c2bd",
             .hash = "zig_ai-0.1.0-0Q8L0BRHNgBeHLmVNmjZ0la63WPGiysWOhvNQ2S5_pMF",
