@@ -184,9 +184,15 @@ test "session cwd encoding matches home temp and absolute upstream buckets" {
     defer allocator.free(home_root);
     try std.testing.expectEqualStrings("-", home_root);
 
-    const temp = try encodeCwdAlloc(allocator, io, "/tmp/work/a", .{
+    // The temp root must be a path that exists on no platform. Canonicalisation
+    // resolves symlinks only for paths that exist, and macOS makes /tmp a
+    // symlink to /private/tmp -- so a literal "/tmp" root would canonicalise
+    // while the fictional cwd beneath it would not, and the mismatched prefix
+    // would drop this case into the absolute bucket on macOS alone. The bucket
+    // prefix is the literal "-tmp" regardless of the configured path.
+    const temp = try encodeCwdAlloc(allocator, io, "/pi-test-temp-root/work/a", .{
         .home = "/home/tester",
-        .temp_dir = "/tmp",
+        .temp_dir = "/pi-test-temp-root",
     });
     defer allocator.free(temp);
     try std.testing.expectEqualStrings("-tmp-work-a", temp);
