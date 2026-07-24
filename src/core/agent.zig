@@ -296,6 +296,11 @@ pub const AgentSession = struct {
 
     /// Call after `run` has returned (normally by sending `.shutdown`).
     pub fn deinit(self: *AgentSession) void {
+        // Backstop for callers that drop the session without running `run` to
+        // completion. Draining the group here guarantees no run task is still
+        // executing against the fields freed below.
+        self.closeToRuns();
+        self.run_group.cancel(self.io);
         self.commands.close(self.io);
         self.event_outbox.close(self.io);
         deinitPromptQueue(self.gpa, &self.initial_queue);
@@ -396,6 +401,16 @@ pub const AgentSession = struct {
     /// Command-processor entry point. It remains responsive while a run task
     /// performs provider calls and tools in `run_group`.
     pub fn run(self: *AgentSession) !void {
+        // Runs on every exit path, not just the `.shutdown` break: the loop
+        // body can also fail out through `try`, and `commands.pop` returning
+        // null ends it without any shutdown command having been seen. Leaving
+        // the group undrained on those paths lets a run task outlive the
+        // session and touch freed memory.
+        defer {
+            self.closeToRuns();
+            self.run_group.cancel(self.io);
+            self.event_outbox.close(self.io);
+        }
         while (try self.commands.pop(self.io)) |owned_command| {
             var command = owned_command;
             defer command.deinit(self.gpa);
@@ -431,8 +446,14 @@ pub const AgentSession = struct {
                 },
             }
         }
-        self.run_group.cancel(self.io);
-        self.event_outbox.close(self.io);
+    }
+
+    /// Marks the session as accepting no further run tasks. Taken under
+    /// `state_mutex` so it cannot interleave with the check in `startRun`.
+    fn closeToRuns(self: *AgentSession) void {
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
+        self.shutting_down.store(true, .release);
     }
 
     fn handlePrompt(self: *AgentSession, prompt: events.OwnedPrompt) !void {
@@ -441,6 +462,13 @@ pub const AgentSession = struct {
     }
 
     fn startRun(self: *AgentSession) void {
+        // Held across the spawn so it cannot interleave with `closeToRuns`.
+        // A run task's own tail calls back into `startRun`, so without this a
+        // task could be added to `run_group` after `cancel` had already drained
+        // it -- that task then runs on a session which is being torn down.
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
+        if (self.shutting_down.load(.acquire)) return;
         if (self.running.swap(true, .acq_rel)) return;
         self.aborted.store(false, .release);
         self.abort_kind.store(.none, .release);
