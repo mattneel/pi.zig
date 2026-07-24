@@ -166,8 +166,8 @@ test "concurrent prompt history appends retain both complete records" {
             _ = try append(std.heap.smp_allocator, task_io, prompt, task_options);
         }
     };
-    var first = io.async(Task.run, .{ io, &start, options, "first concurrent prompt" });
-    var second = io.async(Task.run, .{ io, &start, options, "second concurrent prompt with more bytes" });
+    var first = try io.concurrent(Task.run, .{ io, &start, options, "first concurrent prompt" });
+    var second = try io.concurrent(Task.run, .{ io, &start, options, "second concurrent prompt with more bytes" });
     start.set(io);
     try first.await(io);
     try second.await(io);

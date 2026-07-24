@@ -445,7 +445,14 @@ pub const AgentSession = struct {
         self.aborted.store(false, .release);
         self.abort_kind.store(.none, .release);
         self.retry_abort.reset();
-        self.run_group.async(self.io, runTask, .{self});
+        // Must be `concurrent`, not `async`: `Group.async` may run the task
+        // inline, which would block this call until the whole run finished and
+        // leave the inbox unread for its duration -- so steering, cancel and
+        // shutdown could not be delivered to a run already in progress.
+        self.run_group.concurrent(self.io, runTask, .{self}) catch |err| {
+            self.running.store(false, .release);
+            self.recordCallbackError(err);
+        };
     }
 
     fn runTask(self: *AgentSession) std.Io.Cancelable!void {
@@ -808,7 +815,7 @@ pub const AgentSession = struct {
             }
         };
         var completed: std.Io.Event = .unset;
-        var future = self.io.async(Driver.runAndSignal, .{ self, &result, &capture, message_id, &completed });
+        var future = try self.io.concurrent(Driver.runAndSignal, .{ self, &result, &capture, message_id, &completed });
         self.active_mutex.lockUncancelable(self.io);
         self.active_step = &future;
         self.active_mutex.unlock(self.io);
@@ -1312,8 +1319,8 @@ pub const AgentSession = struct {
                 var buffer: [2]Selected = undefined;
                 var select: std.Io.Select(Selected) = .init(io, &buffer);
                 defer select.cancelDiscard();
-                select.async(.decided, std.Io.Event.wait, .{ &pending.decided, io });
-                select.async(.cancelled, std.Io.Event.wait, .{ &scope.event, io });
+                try select.concurrent(.decided, std.Io.Event.wait, .{ &pending.decided, io });
+                try select.concurrent(.cancelled, std.Io.Event.wait, .{ &scope.event, io });
                 const selected = try select.await();
                 return switch (selected) {
                     .decided => |result| blk: {
@@ -1729,7 +1736,7 @@ test "live AgentSession Anthropic read-tool turn" {
         .max_output_tokens = 128,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "Read marker.txt and return its marker word.", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -1888,7 +1895,7 @@ test "loop integration runs one model step at a time around a client tool" {
         .session_manager = &persistent,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
 
     var prompt = try events.OwnedPrompt.init(allocator, "echo hello", &.{}, false, .user);
     defer prompt.deinit(allocator);
@@ -1998,7 +2005,7 @@ test "loop integration runs one model step at a time around a client tool" {
     });
     defer resumed.deinit();
     try std.testing.expectEqual(@as(usize, 4), resumed.messagesBorrowed().len);
-    var resumed_runner = io.async(AgentSession.run, .{&resumed});
+    var resumed_runner = try io.concurrent(AgentSession.run, .{&resumed});
     var resume_prompt = try events.OwnedPrompt.init(allocator, "continue", &.{}, false, .user);
     defer resume_prompt.deinit(allocator);
     try resumed.inbox().push(io, .{ .prompt = resume_prompt });
@@ -2068,7 +2075,7 @@ test "loop integration blocks an exec tool until the approval command" {
         .approval_mode = .always_ask,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "write", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2182,7 +2189,7 @@ test "loop integration skips a soft-requirement detour then forces one required 
         .tool_choice = .{ .ctx = &reminder_state, .resolve_fn = ReminderState.resolve },
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "act", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2285,7 +2292,7 @@ test "loop integration lets a pending soft requirement outrank an empty-stop ret
         .tool_choice = .{ .ctx = &requirement, .resolve_fn = Requirement.resolve },
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "act", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2346,7 +2353,7 @@ test "loop integration retries one 429 model call then succeeds" {
         .tool_choice = .{ .ctx = &choice_resolutions, .resolve_fn = Choice.resolve },
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "retry", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2404,7 +2411,7 @@ test "loop integration fails fast when provider wait exceeds retry maximum" {
         .retry = .{ .base_delay_ms = 1, .max_delay_ms = 10 },
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "retry", &.{}, false, .user);
     defer prompt.deinit(allocator);
     const started_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
@@ -2480,7 +2487,7 @@ test "loop integration user cancel interrupts retry backoff" {
         .retry = .{ .base_delay_ms = 5_000 },
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "retry", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2546,7 +2553,7 @@ test "loop integration re-prompts an empty stop at most three times" {
         .tools = &registry,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "finish the task", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2594,7 +2601,7 @@ test "loop integration caps consecutive pause-turn continuations at eight" {
         .tools = &registry,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "continue", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2654,7 +2661,7 @@ test "loop integration bounds classifier-confirmed unexpected stops" {
         .unexpected_stop_classifier = .{ .classify_fn = Classifier.classify },
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "finish the task", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2705,7 +2712,7 @@ test "loop integration persists a non-retryable provider error as assistant data
         .tools = &registry,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "fail", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2777,7 +2784,7 @@ test "loop integration cancels a blocked model step as an aborted message" {
         .tools = &registry,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "block", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2857,7 +2864,7 @@ test "loop integration pairs a length-stopped tool call and resamples without ex
         .tools = &registry,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "write", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -2914,7 +2921,7 @@ test "loop integration delivers follow-up only after the yield boundary" {
         .tools = &registry,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var initial = try events.OwnedPrompt.init(allocator, "initial", &.{}, false, .user);
     defer initial.deinit(allocator);
     var follow = try events.OwnedPrompt.init(allocator, "follow-up", &.{}, false, .user);
@@ -3016,7 +3023,7 @@ test "loop integration steering after one exclusive tool skips the rest and inje
         .tools = &registry,
     });
     defer session.deinit();
-    var runner = io.async(AgentSession.run, .{&session});
+    var runner = try io.concurrent(AgentSession.run, .{&session});
     var initial = try events.OwnedPrompt.init(allocator, "start", &.{}, false, .user);
     defer initial.deinit(allocator);
     var steer = try events.OwnedPrompt.init(allocator, "interrupt", &.{}, false, .user);

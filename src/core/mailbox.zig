@@ -139,7 +139,7 @@ test "mailbox cross-task push pop deep-copies and drains after close" {
             try box.push(task_io, .retry);
         }
     };
-    var producer = io.async(Producer.run, .{ &inbox, io, &prompt });
+    var producer = try io.concurrent(Producer.run, .{ &inbox, io, &prompt });
 
     var first = (try inbox.pop(io)).?;
     defer first.deinit(allocator);

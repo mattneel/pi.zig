@@ -131,9 +131,9 @@ fn execute(
     var race_buffer: [3]Race = undefined;
     var select: std.Io.Select(Race) = .init(io, &race_buffer);
     defer select.cancelDiscard();
-    select.async(.process, Context.run, .{process_context});
-    select.async(.deadline, waitSeconds, .{ io, timeout_seconds });
-    select.async(.cancelled, waitForCancel, .{ io, cancel });
+    try select.concurrent(.process, Context.run, .{process_context});
+    try select.concurrent(.deadline, waitSeconds, .{ io, timeout_seconds });
+    try select.concurrent(.cancelled, waitForCancel, .{ io, cancel });
 
     const selected = try select.await();
     const result = switch (selected) {

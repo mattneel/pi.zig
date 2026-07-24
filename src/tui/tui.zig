@@ -416,7 +416,11 @@ pub fn run(
     initial_prompts: []const []const u8,
     stderr: *std.Io.Writer,
 ) !u8 {
-    var runner = io.async(agent.AgentSession.run, .{session});
+    // Must be `concurrent`, not `async`: `Io.async` is permitted to run the
+    // task inline to completion before returning, and the UI loop feeds the
+    // session only afterwards, so an inline run would wait forever for a
+    // prompt that has not been pushed yet.
+    var runner = try io.concurrent(agent.AgentSession.run, .{session});
     var joined = false;
     defer if (!joined) {
         session.inbox().push(io, .shutdown) catch {};

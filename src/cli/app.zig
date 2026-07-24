@@ -513,8 +513,16 @@ fn readPipedInput(
             writer.flush() catch return;
         }
     };
-    var notice = io.async(Notice.emit, .{ io, stderr });
-    defer _ = notice.cancel(io) catch {};
+    // Must be `concurrent`, not `async`: the notice exists to appear only when
+    // the read below actually blocks, and is cancelled when the read wins.
+    // `Io.async` may run the task inline, in which case it would sleep a full
+    // second and print unconditionally before stdin is read at all. The notice
+    // is cosmetic, so an `Io` that cannot supply concurrency simply goes
+    // without it rather than failing the read.
+    var notice = io.concurrent(Notice.emit, .{ io, stderr }) catch null;
+    defer if (notice) |*task| {
+        _ = task.cancel(io) catch {};
+    };
     var buffer: [8192]u8 = undefined;
     var reader = stdin.readerStreaming(io, &buffer);
     return reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));

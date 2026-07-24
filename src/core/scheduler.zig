@@ -221,12 +221,24 @@ pub fn executeToolCalls(
         const segment = records[start..index];
         const futures = try gpa.alloc(std.Io.Future(anyerror!void), segment.len);
         defer gpa.free(futures);
+        // Shared records are meant to overlap, which needs a real unit of
+        // concurrency each: `Io.async` may run a record inline to completion,
+        // serialising the batch and deadlocking any record that waits on
+        // another. An `Io` that cannot supply concurrency runs them in order
+        // instead, which is the single-threaded path.
+        var spawned: usize = 0;
         for (segment, futures) |*record, *future| {
-            future.* = io.async(runRecord, .{ io, record });
+            future.* = io.concurrent(runRecord, .{ io, record }) catch break;
+            spawned += 1;
         }
         var first_error: ?anyerror = null;
-        for (futures) |*future| {
+        for (futures[0..spawned]) |*future| {
             future.await(io) catch |err| if (first_error == null) {
+                first_error = err;
+            };
+        }
+        for (segment[spawned..]) |*record| {
+            runRecord(io, record) catch |err| if (first_error == null) {
                 first_error = err;
             };
         }
@@ -364,10 +376,27 @@ fn runRecord(io: std.Io, record: *Record) anyerror!void {
     var buffer: [3]Race = undefined;
     var select: std.Io.Select(Race) = .init(io, &buffer);
     defer select.cancelDiscard();
-    select.async(.execution, Context.execute, .{context});
-    select.async(.cancelled, waitForCancel, .{ io, record.scope });
-    if (declaration.timeout_ms) |milliseconds| {
-        select.async(.deadline, sleepMilliseconds, .{ io, milliseconds });
+    // Every branch here blocks, so each needs a real unit of concurrency.
+    // `Io.async` is allowed to run a task inline to completion, which would
+    // block inside the tool before the branches meant to cancel or time it out
+    // had even been registered. The watchers are registered first so that an
+    // `Io` which cannot provide concurrency is detected before the tool starts.
+    const raced = blk: {
+        select.concurrent(.cancelled, waitForCancel, .{ io, record.scope }) catch break :blk false;
+        if (declaration.timeout_ms) |milliseconds| {
+            select.concurrent(.deadline, sleepMilliseconds, .{ io, milliseconds }) catch break :blk false;
+        }
+        select.concurrent(.execution, Context.execute, .{context}) catch break :blk false;
+        break :blk true;
+    };
+
+    // A single-threaded `Io` has nothing to race the tool against, so run it
+    // directly rather than pretending to.
+    if (!raced) {
+        record.outcome = try normalizeOutcome(arena, context.execute() catch |err| try errorOutcome(arena, @errorName(err)));
+        emitFinished(record);
+        try checkSteering(io, record);
+        return;
     }
 
     const selected = try select.await();
@@ -795,7 +824,7 @@ test "scheduler parks before starting a tool without cancelling the batch" {
             );
         }
     };
-    var future = std.testing.io.async(Runner.run, .{
+    var future = try std.testing.io.concurrent(Runner.run, .{
         output_arena_state.allocator(),
         &registry,
         &scope,
@@ -915,7 +944,7 @@ test "scheduler interruptible tool observes the 250ms non-consuming steering pol
             );
         }
     };
-    var future = std.testing.io.async(Runner.run, .{
+    var future = try std.testing.io.concurrent(Runner.run, .{
         std.testing.io,
         output_arena_state.allocator(),
         &registry,

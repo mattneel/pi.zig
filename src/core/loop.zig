@@ -595,7 +595,7 @@ test "loop pause gate releases only after resume" {
             return value.waitUntilResumed(task_io, stop);
         }
     };
-    var future = io.async(Waiter.run, .{ &gate, io, &aborted });
+    var future = try io.concurrent(Waiter.run, .{ &gate, io, &aborted });
     try io.sleep(.fromMilliseconds(1), .awake);
     try std.testing.expect(gate.@"resume"(io) != null);
     try future.await(io);
@@ -611,7 +611,7 @@ test "loop abort wakes only its pause waiter and leaves the global gate paused" 
             return value.waitUntilResumed(task_io, stop);
         }
     };
-    var future = io.async(Waiter.run, .{ &gate, io, &aborted });
+    var future = try io.concurrent(Waiter.run, .{ &gate, io, &aborted });
     try io.sleep(.fromMilliseconds(1), .awake);
     aborted.store(true, .release);
     gate.wake(io);

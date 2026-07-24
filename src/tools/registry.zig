@@ -132,7 +132,7 @@ fn runAgentEdit(
         .tools = tools,
     });
     defer session.deinit();
-    var runner = io.async(agent.AgentSession.run, .{&session});
+    var runner = try io.concurrent(agent.AgentSession.run, .{&session});
     var prompt = try events.OwnedPrompt.init(allocator, "apply the edit", &.{}, false, .user);
     defer prompt.deinit(allocator);
     try session.inbox().push(io, .{ .prompt = prompt });
@@ -227,7 +227,7 @@ test "integration real registry drives read then edit through AgentSession" {
         .tools = &tools,
     });
     defer session.deinit();
-    var runner = io.async(agent.AgentSession.run, .{&session});
+    var runner = try io.concurrent(agent.AgentSession.run, .{&session});
 
     var prompt = try events.OwnedPrompt.init(allocator, "change the file", &.{}, false, .user);
     defer prompt.deinit(allocator);
