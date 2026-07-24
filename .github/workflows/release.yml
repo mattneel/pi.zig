@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # anyzig resolves the compiler version from minimum_zig_version in
+      # build.zig.zon, matching local development exactly.
+      - name: Install Zig
+        uses: mattneel/setup-anyzig@v1
+
+      # A fast re-verification of the release commit. The full platform matrix
+      # already runs for every push to master in ci.yml.
+      - name: Run release gate
+        run: zig build test --summary all
+
+  package:
+    name: Package
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # anyzig resolves the compiler version from minimum_zig_version in
+      # build.zig.zon, matching local development exactly.
+      - name: Install Zig
+        uses: mattneel/setup-anyzig@v1
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version=$(awk -F'"' '/^[[:space:]]*\.version = "/ { print $2; exit }' build.zig.zon)
+          fi
+          echo "version=${version#v}" >>"$GITHUB_OUTPUT"
+          echo "release_ref=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Build and package release assets
+        run: >-
+          bash scripts/package-release.sh
+          --version "${{ steps.version.outputs.release_ref }}"
+          --output dist
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    if: github.event_name != 'workflow_dispatch'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-${{ needs.package.outputs.version }}
+          path: dist
+
+      # pi.zig has no CHANGELOG.md, so notes come from the commit log between
+      # tags rather than a hand-written section.
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" dist/*
+          --repo "${GITHUB_REPOSITORY}"
+          --verify-tag
+          --title "pi.zig ${GITHUB_REF_NAME}"
+          --generate-notes

@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
   pull_request:
   workflow_dispatch:
 
@@ -14,21 +15,93 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+          - os: macos-latest
+            arch: arm64
+          # macos-15-intel is absent: setup-anyzig has no macOS-X64 case, so
+          # the install step fails there. Upstream anyzig does publish
+          # anyzig-x86_64-macos.tar.gz, so this is a gap in the action rather
+          # than a real platform limit. The cross job below still proves
+          # x86_64-macos builds, and release artifacts for it are produced by
+          # cross-compiling from Linux.
+          #
+          # Windows is absent for a harder reason: tuizr's Terminal is
+          # POSIX-only. `output_fd: std.posix.fd_t = std.posix.STDOUT_FILENO`
+          # does not compile for windows targets, where fd_t is a *anyopaque
+          # HANDLE rather than an integer, and platform/linux.zig is imported
+          # unconditionally. Windows needs a console backend in tuizr first.
 
     steps:
-      - name: Checkout
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # anyzig resolves the compiler version from minimum_zig_version in
+      # build.zig.zon (currently 0.16.0), matching local development exactly.
+      - name: Install Zig
+        uses: mattneel/setup-anyzig@v1
+        with:
+          cache-key: ${{ matrix.arch }}
+
+      - name: Toolchain info
+        run: |
+          zig any version
+          zig version
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build executable
+        run: zig build --summary all
+
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mattneel/setup-anyzig@v1
+
+      - name: Check formatting
+        run: zig fmt --check build.zig src
+
+  cross:
+    name: Cross-compile (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-macos
+          - aarch64-macos
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mattneel/setup-anyzig@v1
         with:
-          version: 0.16.0
+          cache-key: ${{ matrix.target }}
 
-      - name: Build
-        run: zig build
-
-      - name: Test
-        run: zig build test
+      # Guards the release target set: every artifact release.yml ships must
+      # keep cross-compiling from Linux.
+      - name: Build release target
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --summary all
